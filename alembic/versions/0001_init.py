@@ -14,6 +14,19 @@ branch_labels = None
 depends_on = None
 
 def upgrade():
+    # ------------------------------------------------------------------
+    # Idempotency guard: if the schema already exists (e.g. created by
+    # Base.metadata.create_all or a previous partial run), skip entirely.
+    # This prevents DuplicateTable errors when alembic upgrade head runs
+    # on a database that was bootstrapped outside of Alembic.
+    # ------------------------------------------------------------------
+    conn = op.get_bind()
+    has_users = conn.execute(
+        sa.text("SELECT to_regclass('public.users')")
+    ).scalar()
+    if has_users:
+        return  # Schema already exists — nothing to do
+
     op.create_table(
         "users",
         sa.Column("id", sa.String(), primary_key=True),
