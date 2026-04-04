@@ -4230,15 +4230,40 @@ def _safe_json_loads(raw: Any, default: Any):
         return default
 
 def _extract_runtime_memory_candidates(message: str, intent_package: Optional[Dict[str, Any]], first_win_plan: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    # PATCH_LEARN: Enhanced memory extraction with bilingual keywords and more categories
     text = (message or "").strip()
     low = text.lower()
     out: Dict[str, str] = {}
     if not text:
         return out
-    if any(k in low for k in ["prioridade", "foco", "principal projeto", "travando", "bloqueio", "roadmap", "execução"]):
+    # Active priorities (PT + EN)
+    if any(k in low for k in ["prioridade", "foco", "principal projeto", "travando", "bloqueio", "roadmap", "execução",
+                               "priority", "focus", "main project", "blocked", "blocker", "execution", "urgent"]):
         out["active_priority"] = text[:500]
-    if any(k in low for k in ["decisão", "escolher", "aprovar", "seguir com"]):
+    # Pending decisions (PT + EN)
+    if any(k in low for k in ["decisão", "escolher", "aprovar", "seguir com",
+                               "decision", "choose", "approve", "go with", "proceed with"]):
         out["pending_decision"] = text[:500]
+    # User preferences (PT + EN)
+    if any(k in low for k in ["prefiro", "gosto de", "meu estilo", "minha preferência",
+                               "i prefer", "i like", "my style", "my preference"]):
+        out["user_preference"] = text[:500]
+    # Business context (PT + EN)
+    if any(k in low for k in ["minha empresa", "nosso negócio", "nosso produto", "nosso serviço",
+                               "my company", "our business", "our product", "our service", "revenue", "receita", "faturamento"]):
+        out["business_context"] = text[:500]
+    # Goals and vision (PT + EN)
+    if any(k in low for k in ["meu objetivo", "minha meta", "quero alcançar", "visão",
+                               "my goal", "my target", "i want to achieve", "vision", "milestone"]):
+        out["user_goal"] = text[:500]
+    # Team and people (PT + EN)
+    if any(k in low for k in ["minha equipe", "meu time", "sócio", "parceiro",
+                               "my team", "partner", "co-founder", "colleague"]):
+        out["team_context"] = text[:500]
+    # Challenges (PT + EN)
+    if any(k in low for k in ["desafio", "problema", "dificuldade", "dor",
+                               "challenge", "problem", "difficulty", "pain point", "struggle"]):
+        out["active_challenge"] = text[:500]
     if intent_package and intent_package.get("intent"):
         out["latest_intent"] = str(intent_package.get("intent"))
     if first_win_plan and first_win_plan.get("expected_result"):
@@ -6493,8 +6518,417 @@ async def chat_stream(
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
+         background=BackgroundTask(_bg_release_stream, request),
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PATCH_ORCH: Autonomous Orchestration — Orkio as Maestro
+# Receives a high-level task, uses LLM to decompose into agent-specific sub-tasks,
+# then executes each sub-task sequentially via the existing _openai_answer infra,
+# streaming results per-agent exactly like /api/chat/stream.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class OrchestrateIn(BaseModel):
+    tenant: str = Field(default_tenant(), min_length=1)
+    thread_id: Optional[str] = None
+    message: str = Field(min_length=1)
+    client_message_id: Optional[str] = None
+    trace_id: Optional[str] = None
+
+
+def _orchestrate_planner_prompt(agents_info: List[Dict[str, Any]]) -> str:
+    """Build the system prompt for the Orkio planner LLM call."""
+    agent_lines = []
+    for ag in agents_info:
+        name = ag.get("name") or "Agent"
+        desc = ag.get("description") or ag.get("system_prompt", "")[:200] or "General assistant"
+        agent_lines.append(f"- {name}: {desc}")
+    agents_block = "\n".join(agent_lines)
+    return (
+        "You are Orkio, the CEO and orchestrator of a multi-agent organization.\n"
+        "Your job is to receive a high-level task from the user and decompose it into\n"
+        "specific, actionable sub-tasks — one per agent — based on each agent's role.\n\n"
+        "Available agents:\n"
+        f"{agents_block}\n\n"
+        "RULES:\n"
+        "1. Return ONLY a valid JSON array. No markdown, no explanation, no code fences.\n"
+        "2. Each element must be: {\"agent_name\": \"<exact name>\", \"sub_task\": \"<specific instruction>\"}\n"
+        "3. Order the array by logical execution priority (who should go first).\n"
+        "4. Each sub_task must be specific and actionable — NOT the original user message.\n"
+        "5. Only include agents that are relevant to the task. Skip irrelevant ones.\n"
+        "6. Write sub_tasks in the same language as the user's message.\n"
+        "7. Maximum 8 agents per plan.\n"
+    )
+
+
+def _parse_orchestration_plan(raw: str) -> List[Dict[str, str]]:
+    """Parse the LLM planner output into a list of {agent_name, sub_task}."""
+    import re as _re
+    # Strip markdown code fences if present
+    cleaned = _re.sub(r"```(?:json)?\s*", "", raw or "").strip().rstrip("`")
+    try:
+        parsed = json.loads(cleaned)
+    except Exception:
+        # Try to find JSON array in the text
+        match = _re.search(r"\[.*\]", cleaned, _re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group())
+            except Exception:
+                return []
+        else:
+            return []
+    if not isinstance(parsed, list):
+        return []
+    result = []
+    for item in parsed[:8]:
+        if isinstance(item, dict) and item.get("agent_name") and item.get("sub_task"):
+            result.append({
+                "agent_name": str(item["agent_name"]).strip(),
+                "sub_task": str(item["sub_task"]).strip(),
+            })
+    return result
+
+
+@app.post("/api/orchestrate")
+async def orchestrate(
+    inp: OrchestrateIn,
+    request: Request,
+    x_org_slug: Optional[str] = Header(default=None),
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Autonomous orchestration endpoint. Orkio decomposes a task and delegates to agents."""
+    import time
+    from starlette.responses import StreamingResponse
+
+    require_onboarding_complete(user)
+    org = _resolve_org(user, x_org_slug)
+    uid = user.get("sub")
+    message = (inp.message or "").strip()
+    if not message:
+        raise HTTPException(400, "message required")
+    trace_id = inp.trace_id or new_id()
+    client_message_id = inp.client_message_id
+
+    # Thread
+    tid = (inp.thread_id or "").strip() or None
+    try:
+        if not tid:
+            t = Thread(id=new_id(), org_slug=org, title="Orchestration")
+            db.add(t)
+            db.commit()
+            tid = t.id
+            try:
+                _ensure_thread_owner(db, org, tid, uid)
+            except Exception:
+                try: db.rollback()
+                except Exception: pass
+        else:
+            t = db.execute(select(Thread).where(Thread.id == tid, Thread.org_slug == org)).scalar_one_or_none()
+            if not t:
+                raise HTTPException(404, "thread not found")
+            if user.get("role") != "admin":
+                _require_thread_member(db, org, tid, uid)
+    except Exception:
+        try: db.rollback()
+        except Exception: pass
+        raise
+
+    # Load all agents
+    all_agents_rows = db.execute(select(Agent).where(Agent.org_slug == org, Agent.active == True)).scalars().all()
+    if not all_agents_rows:
+        raise HTTPException(400, "no agents configured")
+
+    agents_info: List[Dict[str, Any]] = [
+        {
+            "id": ag.id,
+            "name": ag.name,
+            "description": getattr(ag, "description", None),
+            "system_prompt": getattr(ag, "system_prompt", None),
+            "model": getattr(ag, "model", None),
+            "temperature": getattr(ag, "temperature", None),
+            "rag_enabled": getattr(ag, "rag_enabled", None),
+            "rag_top_k": getattr(ag, "rag_top_k", None),
+            "voice_id": getattr(ag, "voice_id", None),
+            "avatar_url": getattr(ag, "avatar_url", None),
+        }
+        for ag in all_agents_rows
+    ]
+    alias_to_info: Dict[str, Dict[str, Any]] = {}
+    for ag in agents_info:
+        full = (ag.get("name") or "").strip().lower()
+        alias_to_info[full] = ag
+        first = full.split()[0] if full.split() else full
+        if first:
+            alias_to_info.setdefault(first, ag)
+
+    # Persist user message
+    try:
+        m_user, _ = _get_or_create_user_message(db, org, tid, user, message, client_message_id)
+    except Exception:
+        try: db.rollback()
+        except Exception: pass
+        raise
+
+    # History
+    prev = list(
+        db.execute(
+            select(Message)
+            .where(Message.org_slug == org, Message.thread_id == tid, Message.id != m_user.id)
+            .order_by(Message.created_at.asc())
+            .limit(64)
+        ).scalars().all()
+    )
+    history_dicts = []
+    for pm in prev[-16:]:
+        role = getattr(pm, "role", "") or ""
+        content = getattr(pm, "content", "") or ""
+        if role and content:
+            history_dicts.append({"role": role, "content": content})
+
+    def sse_event(ev: str, data: Dict[str, Any]) -> str:
+        return f"event: {ev}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    async def gen():
+        try:
+            yield sse_event("status", {"phase": "planning", "status": "Orkio está analisando a tarefa e montando o plano...", "thread_id": tid, "trace_id": trace_id})
+        except Exception:
+            return
+
+        # Step 1: Planner call — Orkio decomposes the task
+        planner_system = _orchestrate_planner_prompt(agents_info)
+        try:
+            planner_result = await asyncio.to_thread(
+                _openai_answer,
+                f"Task from user: {message}",
+                [],  # no RAG for planner
+                history_dicts,
+                planner_system,
+                "gpt-4.1-mini",  # fast + smart enough for planning
+                0.3,
+            )
+        except Exception as e:
+            yield sse_event("error", {"message": f"Planner failed: {e}", "trace_id": trace_id})
+            yield sse_event("done", {"done": True, "thread_id": tid, "trace_id": trace_id})
+            return
+
+        if not planner_result or not (planner_result.get("text") or "").strip():
+            yield sse_event("error", {"message": "Orkio não conseguiu gerar um plano de execução.", "trace_id": trace_id})
+            yield sse_event("done", {"done": True, "thread_id": tid, "trace_id": trace_id})
+            return
+
+        plan = _parse_orchestration_plan(planner_result["text"])
+        if not plan:
+            # Fallback: treat as regular team message
+            yield sse_event("error", {"message": "Plano inválido. Tente reformular a tarefa.", "trace_id": trace_id})
+            yield sse_event("done", {"done": True, "thread_id": tid, "trace_id": trace_id})
+            return
+
+        # Emit the plan to frontend
+        yield sse_event("plan", {
+            "plan": plan,
+            "total_agents": len(plan),
+            "thread_id": tid,
+            "trace_id": trace_id,
+        })
+
+        # Persist Orkio's plan as an assistant message
+        plan_summary_lines = [f"**Plano de execução:**"]
+        for idx, step in enumerate(plan, 1):
+            plan_summary_lines.append(f"{idx}. **@{step['agent_name']}**: {step['sub_task']}")
+        plan_summary = "\n".join(plan_summary_lines)
+        try:
+            m_plan = Message(
+                id=new_id(), org_slug=org, thread_id=tid, role="assistant",
+                content=plan_summary, agent_id=None, agent_name="Orkio",
+                created_at=now_ts(),
+            )
+            db.add(m_plan)
+            db.commit()
+        except Exception:
+            try: db.rollback()
+            except Exception: pass
+
+        # Emit the plan summary as chunks so frontend renders it
+        step_size = 140
+        for i in range(0, len(plan_summary), step_size):
+            chunk = plan_summary[i:i + step_size]
+            try:
+                yield sse_event("chunk", {
+                    "agent_id": None, "agent_name": "Orkio",
+                    "content": chunk, "delta": chunk,
+                    "thread_id": tid, "trace_id": trace_id,
+                })
+            except Exception:
+                return
+        try:
+            yield sse_event("agent_done", {"done": True, "agent_id": None, "agent_name": "Orkio", "thread_id": tid, "trace_id": trace_id})
+        except Exception:
+            return
+
+        # Step 2: Execute each sub-task on the designated agent
+        KEEPALIVE_SECS = int(os.getenv("SSE_KEEPALIVE_SECONDS", "15") or 15)
+        for step_idx, step in enumerate(plan):
+            if await request.is_disconnected():
+                return
+
+            agent_name_key = (step.get("agent_name") or "").strip().lower()
+            first_word = agent_name_key.split()[0] if agent_name_key.split() else agent_name_key
+            ag = alias_to_info.get(agent_name_key) or alias_to_info.get(first_word)
+            if not ag:
+                try:
+                    yield sse_event("error", {"message": f"Agent '{step.get('agent_name')}' not found", "trace_id": trace_id})
+                except Exception:
+                    return
+                continue
+
+            ag_id = ag.get("id")
+            ag_name = ag.get("name") or "Agent"
+            sub_task = step.get("sub_task") or message
+
+            yield sse_event("status", {
+                "phase": "agent", "agent_id": ag_id, "agent_name": ag_name,
+                "status": f"Executando @{ag_name}...", "step": step_idx + 1,
+                "total_steps": len(plan), "trace_id": trace_id,
+            })
+
+            # Build agent prompt with delegation context
+            delegation_prompt = (
+                f"Você é {ag_name}. O Orkio (CEO) delegou a seguinte tarefa específica para você:\n\n"
+                f"TAREFA: {sub_task}\n\n"
+                f"CONTEXTO ORIGINAL DO USUÁRIO: {message}\n\n"
+                f"Responda de forma completa e profissional, focando APENAS na sua tarefa delegada. "
+                f"Não repita o que outros agentes farão. Seja objetivo e entregue valor."
+            )
+
+            ag_system_prompt = (ag.get("system_prompt") or "").strip()
+            ag_model = ag.get("model") or None
+            ag_temperature = float(ag.get("temperature") if ag.get("temperature") not in (None, "") else 0.3) or 0.3
+
+            # RAG context per agent
+            ag_rag_enabled = bool(ag.get("rag_enabled")) if ag.get("rag_enabled") is not None else True
+            citations = []
+            if ag_id and ag_rag_enabled:
+                try:
+                    linked_ids = get_linked_agent_ids(db, org, ag_id)
+                    scope_ids = [ag_id] + linked_ids
+                    file_ids = get_agent_file_ids(db, org, scope_ids)
+                    citations = keyword_retrieve(db, org, sub_task, file_ids=file_ids, top_k=int(ag.get("rag_top_k") or 6))
+                except Exception:
+                    citations = []
+
+            # LLM call
+            try:
+                llm_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        _openai_answer,
+                        delegation_prompt,
+                        citations,
+                        history_dicts,
+                        ag_system_prompt,
+                        ag_model,
+                        ag_temperature,
+                    )
+                )
+                last_keepalive = time.monotonic()
+                while not llm_task.done():
+                    if await request.is_disconnected():
+                        try: llm_task.cancel()
+                        except Exception: pass
+                        return
+                    now = time.monotonic()
+                    if now - last_keepalive >= KEEPALIVE_SECS:
+                        last_keepalive = now
+                        try:
+                            yield sse_event("keepalive", {"ts": int(time.time()), "trace_id": trace_id})
+                        except Exception:
+                            return
+                    await asyncio.sleep(1.0)
+
+                ans_obj = await llm_task
+            except Exception as e:
+                try:
+                    yield sse_event("error", {"agent_id": ag_id, "message": str(e), "trace_id": trace_id})
+                    yield sse_event("agent_done", {"done": True, "agent_id": ag_id, "trace_id": trace_id})
+                except Exception:
+                    return
+                continue
+
+            if not ans_obj or not (ans_obj.get("text") or "").strip():
+                try:
+                    yield sse_event("error", {"agent_id": ag_id, "message": "Empty response", "trace_id": trace_id})
+                    yield sse_event("agent_done", {"done": True, "agent_id": ag_id, "trace_id": trace_id})
+                except Exception:
+                    return
+                continue
+
+            ans = (ans_obj.get("text") or "").strip()
+
+            # Persist
+            try:
+                m_ass = Message(
+                    id=new_id(), org_slug=org, thread_id=tid, role="assistant",
+                    content=ans, agent_id=ag_id, agent_name=ag_name,
+                    created_at=now_ts(),
+                )
+                db.add(m_ass)
+                db.commit()
+                try:
+                    _track_cost(
+                        db=db, org=org, uid=uid, tid=tid, message_id=m_ass.id,
+                        agent=type("OrchAgentProxy", (), {"id": ag_id, "name": ag_name})(),
+                        ans_obj=ans_obj, user_msg=delegation_prompt, answer=ans,
+                        streaming=True, estimated=False,
+                    )
+                except Exception:
+                    try: db.rollback()
+                    except Exception: pass
+            except Exception:
+                try: db.rollback()
+                except Exception: pass
+
+            # Emit chunks
+            for i in range(0, len(ans), step_size):
+                if await request.is_disconnected():
+                    return
+                chunk = ans[i:i + step_size]
+                try:
+                    yield sse_event("chunk", {
+                        "agent_id": ag_id, "agent_name": ag_name,
+                        "content": chunk, "delta": chunk,
+                        "thread_id": tid, "trace_id": trace_id,
+                    })
+                except Exception:
+                    return
+
+            try:
+                yield sse_event("agent_done", {"done": True, "agent_id": ag_id, "agent_name": ag_name, "thread_id": tid, "trace_id": trace_id})
+            except Exception:
+                return
+
+        # Done global
+        try:
+            yield sse_event("done", {"done": True, "thread_id": tid, "trace_id": trace_id})
+        except Exception:
+            return
+
+    await _stream_acquire(request)
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "X-Trace-Id": trace_id,
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
         background=BackgroundTask(_bg_release_stream, request),
     )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# END PATCH_ORCH
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/tts")
 async def tts_endpoint(

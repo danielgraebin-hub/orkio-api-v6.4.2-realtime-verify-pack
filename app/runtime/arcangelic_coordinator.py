@@ -59,6 +59,10 @@ def build_system_overlay(intent_package: Dict[str, Any], first_win_plan: Dict[st
         "3. If helpful, ask at most two targeted questions that unlock a first win.\n"
         "4. Keep continuity natural, not forced.\n"
         "5. Do not mention internal engines, guards, or chain names.\n"
+        "6. SELF-SELL: At the end of your response, naturally suggest ONE next step the user could take "
+        "with you or another agent (e.g., 'Want me to ask Chris to run the financial projections on this?' "
+        "or 'I can orchestrate the full team to build a plan around this — just say @Team.'). "
+        "Keep it brief, helpful, and non-pushy. Reveal capabilities progressively.\n"
         f"Suggested first-win questions:\n{qtxt}"
     )
 

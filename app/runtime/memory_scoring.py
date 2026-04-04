@@ -7,10 +7,15 @@ def score_memory_candidate(memory_key: str, memory_value: str, intent_confidence
     score = 0.45
     if value:
         score += min(0.18, len(value) / 600.0)
+    # PATCH_LEARN: Expanded scoring for new memory categories
     if key.startswith("active_") or key.startswith("pending_"):
         score += 0.14
     if key in {"latest_intent", "expected_result"}:
         score += 0.08
+    if key in {"user_preference", "user_goal"}:
+        score += 0.12
+    if key in {"business_context", "team_context"}:
+        score += 0.10
     if source == "chat_runtime":
         score += 0.05
     score += min(0.12, max(0.0, float(intent_confidence or 0.0)) * 0.12)
