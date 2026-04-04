@@ -4,7 +4,7 @@ import os
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import engine_from_config, pool, text
 
 from app.db import Base
 from app import models  # noqa: F401
@@ -82,6 +82,36 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
+        # Recovery de produção:
+        # Se o schema já existe (ex.: tabela users),
+        # e a tabela alembic_version existe mas está vazia,
+        # grava a revisão correta para impedir replay do 0001_init.
+        try:
+            has_users = connection.execute(
+                text("select to_regclass('public.users')")
+            ).scalar()
+
+            has_alembic = connection.execute(
+                text("select to_regclass('public.alembic_version')")
+            ).scalar()
+
+            if has_users and has_alembic:
+                count = connection.execute(
+                    text("select count(*) from alembic_version")
+                ).scalar()
+
+                if count == 0:
+                    connection.execute(
+                        text(
+                            "insert into alembic_version (version_num) "
+                            "values ('0026_patch_v64_realtime_schema_reconcile')"
+                        )
+                    )
+                    connection.commit()
+        except Exception:
+            # Nunca derrubar migrations por causa do recovery defensivo
+            pass
+
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
