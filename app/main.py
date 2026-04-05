@@ -865,12 +865,12 @@ Response style:
 
 Specialist collaboration:
 - Chris is the CFO and Orion is the CTO
-- if a specialist perspective would help, ask for approval BEFORE bringing them in
-- examples:
-  "I could bring Chris, our CFO, into this discussion to evaluate the financial implications. Would you like me to invite her?"
-  "Orion might add a valuable technical perspective here. Should I bring him in?"
-- only one specialist should speak at a time
-- after a specialist speaks, you may briefly synthesize the takeaway
+- if the user directly asks for Chris, Orion, CFO, CTO, finance, technology, team, board, or multiple perspectives, call the relevant specialist immediately
+- do not say you need to verify availability
+- do not ask permission again when the user has already requested the specialist
+- when a specialist is called, briefly hand off with one short sentence, then let the specialist answer
+- when the request is broad or ambiguous, Orkio may answer first and then bring one or more specialists as needed
+- after specialists speak, Orkio may briefly synthesize the takeaway
 
 Live mode:
 - prioritize clarity, confidence, and presence
@@ -7553,6 +7553,35 @@ async def realtime_start(
 
 
 
+
+def _detect_requested_agent_names(message: str) -> List[str]:
+    raw = (message or "").strip().lower()
+    if not raw:
+        return []
+    requested: List[str] = []
+    patterns = [
+        ("Chris", [r"@chris\b", r"\bchris\b", r"\bcfo\b", r"financeir", r"financial", r"financ"]),
+        ("Orion", [r"@orion\b", r"\borion\b", r"\bcto\b", r"tecnolog", r"technical", r"arquitetur", r"engineering"]),
+    ]
+    for name, pats in patterns:
+        for pat in pats:
+            if re.search(pat, raw, flags=re.IGNORECASE):
+                requested.append(name)
+                break
+    if re.search(r"@team\b|\bteam\b|\bequipe\b|\bboard\b|\bconselho\b|\bambos\b|\btodos\b", raw, flags=re.IGNORECASE):
+        for name in ("Chris", "Orion"):
+            if name not in requested:
+                requested.append(name)
+    return requested
+
+def _build_realtime_handoff_line(host_name: str, requested: List[str]) -> Optional[str]:
+    if not requested:
+        return None
+    if len(requested) == 1:
+        return f"{host_name}: trazendo {requested[0]} agora."
+    names = " e ".join(requested)
+    return f"{host_name}: trazendo {names} agora."
+
 def _run_realtime_multi_agent_turn(
     db: Session,
     *,
@@ -7599,6 +7628,17 @@ def _run_realtime_multi_agent_turn(
     if not target_agents:
         target_agents = [host_agent]
 
+    requested_names = _detect_requested_agent_names(text_in)
+
+    if requested_names:
+        filtered = [a for a in target_agents if (a.name or "") in requested_names]
+        if filtered:
+            # When the user explicitly requests specialists, skip host-only answer and bring them immediately.
+            target_agents = filtered
+    elif len(target_agents) > 1:
+        # Default behavior: host + linked agents remains allowed when team mode exists.
+        pass
+
     tid = rs.thread_id
     uid = user.get("sub")
 
@@ -7609,8 +7649,50 @@ def _run_realtime_multi_agent_turn(
     ).scalars().all()
 
     has_team = len(target_agents) > 1
-    mention_tokens: List[str] = []
+    mention_tokens: List[str] = [f"@{name}" for name in requested_names]
     answers: List[Dict[str, Any]] = []
+
+    handoff_line = _build_realtime_handoff_line(getattr(host_agent, "name", None) or "Orkio", requested_names)
+    if handoff_line:
+        try:
+            db.add(
+                Message(
+                    id=new_id(),
+                    org_slug=org,
+                    thread_id=tid,
+                    user_id=None,
+                    user_name=None,
+                    role="assistant",
+                    content=handoff_line,
+                    agent_id=host_agent.id,
+                    agent_name=host_agent.name,
+                    created_at=now_ts(),
+                )
+            )
+            db.add(
+                RealtimeEvent(
+                    id=new_id(),
+                    org_slug=org,
+                    session_id=rs.id,
+                    thread_id=tid,
+                    speaker_type="agent",
+                    speaker_id=host_agent.id,
+                    agent_id=host_agent.id,
+                    agent_name=host_agent.name,
+                    event_type="response.final",
+                    transcript_raw=handoff_line,
+                    transcript_punct=handoff_line,
+                    created_at=now_ts(),
+                    client_event_id=None,
+                    meta=json.dumps({"source": "realtime_multi_agent_handoff"}, ensure_ascii=False),
+                )
+            )
+            db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
     for agent in target_agents:
         history: List[Dict[str, str]] = []
@@ -7661,7 +7743,7 @@ def _run_realtime_multi_agent_turn(
             except Exception:
                 temperature = None
 
-        user_msg = _build_agent_prompt(agent, text_in, has_team, mention_tokens)
+        user_msg = _build_agent_prompt(agent, text_in, has_team or bool(requested_names), mention_tokens)
         effective_system_prompt = agent.system_prompt if agent else None
 
         ans_obj = _openai_answer(
@@ -7723,18 +7805,13 @@ def _run_realtime_multi_agent_turn(
     db.commit()
 
     try:
-        _audit_realtime_safe(
-            db,
-            org,
-            uid,
-            action="realtime.multi_agent.turn",
-            meta={
-                "session_id": rs.id,
-                "thread_id": tid,
-                "host_agent_id": getattr(host_agent, "id", None),
-                "target_agents": [a.get("agent_name") for a in answers],
-            },
-        )
+        _audit(db, org, uid, action="realtime.multi_agent.turn", meta={
+            "session_id": rs.id,
+            "thread_id": tid,
+            "host_agent_id": getattr(host_agent, "id", None),
+            "requested_agents": requested_names,
+            "target_agents": [a.get("agent_name") for a in answers],
+        })
     except Exception:
         pass
 
@@ -8119,19 +8196,27 @@ def realtime_get_session(
     evs = db.execute(q).scalars().all()
 
     def _ev_to_dict(ev: RealtimeEvent) -> dict:
+        speaker_type = getattr(ev, "speaker_type", None)
+        transcript_raw = getattr(ev, "transcript_raw", None)
+        legacy_role = getattr(ev, "role", None)
+        legacy_content = getattr(ev, "content", None)
         return {
             "id": ev.id,
             "session_id": ev.session_id,
             "thread_id": ev.thread_id,
-            "role": ev.role,
-            "agent_id": ev.agent_id,
-            "agent_name": ev.agent_name,
-            "event_type": ev.event_type,
-            "content": ev.content,
+            "speaker_type": speaker_type or legacy_role,
+            "speaker_id": getattr(ev, "speaker_id", None),
+            "role": speaker_type or legacy_role,
+            "agent_id": getattr(ev, "agent_id", None),
+            "agent_name": getattr(ev, "agent_name", None),
+            "event_type": getattr(ev, "event_type", None),
+            "transcript_raw": transcript_raw or legacy_content,
+            "content": transcript_raw or legacy_content,
             "transcript_punct": getattr(ev, "transcript_punct", None),
-            "created_at": ev.created_at,
-            "is_final": bool(getattr(ev, "is_final", False)),
-            "meta": ev.meta,
+            "created_at": getattr(ev, "created_at", None),
+            "is_final": bool(str(getattr(ev, "event_type", "")).endswith(".final")),
+            "client_event_id": getattr(ev, "client_event_id", None),
+            "meta": getattr(ev, "meta", None),
         }
 
     try:
@@ -8145,9 +8230,10 @@ def realtime_get_session(
     out_events = []
     for ev in evs:
         d = _ev_to_dict(ev)
-        if finals_only and (ev.event_type or "").endswith(".final") and (ev.content or "").strip():
+        ev_text = (getattr(ev, "transcript_raw", None) or getattr(ev, "content", None) or "").strip()
+        if finals_only and (ev.event_type or "").endswith(".final") and ev_text:
             punct_total += 1
-            if (getattr(ev, "transcript_punct", None) or "").strip():
+            if (getattr(ev, "transcript_punct", None) or ev_text).strip():
                 punct_ready += 1
         out_events.append(d)
 
