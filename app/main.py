@@ -7584,6 +7584,46 @@ def _build_realtime_handoff_line(host_name: str, requested: List[str]) -> Option
     first = requested[0]
     return f"{host_name}: claro, vou chamar {names} agora. {first}, pode começar trazendo sua visão sobre isso?"
 
+
+def _explicit_agent_override(db: Session, org: str, text: str) -> List[Agent]:
+    """
+    Detecta pedido explícito de agente por nome/alias e resolve diretamente do banco.
+    Ignora planner e AgentLink.
+    """
+    raw = (text or "").strip().lower()
+    if not raw:
+        return []
+
+    requested: List[str] = []
+
+    patterns = {
+        "Orion": ["orion", "cto", "@orion"],
+        "Chris": ["chris", "cfo", "@chris"],
+    }
+
+    for canonical, aliases in patterns.items():
+        if any(alias in raw for alias in aliases):
+            requested.append(canonical)
+
+    if re.search(r"@team\b|\bteam\b|\bequipe\b|\bboard\b|\bconselho\b|\bambos\b|\btodos\b", raw, flags=re.IGNORECASE):
+        for canonical in ("Chris", "Orion"):
+            if canonical not in requested:
+                requested.append(canonical)
+
+    if not requested:
+        return []
+
+    rows = db.execute(
+        select(Agent).where(
+            Agent.org_slug == org,
+            Agent.name.in_(requested),
+        )
+    ).scalars().all()
+
+    by_name = {(a.name or "").strip().lower(): a for a in rows}
+    ordered = [by_name[name.strip().lower()] for name in requested if name.strip().lower() in by_name]
+    return ordered
+
 def _run_realtime_multi_agent_turn(
     db: Session,
     *,
@@ -7613,22 +7653,26 @@ def _run_realtime_multi_agent_turn(
     if not host_agent:
         return []
 
-    linked_ids = get_linked_agent_ids(db, org, host_agent.id)
-    ordered_ids = [host_agent.id] + [x for x in linked_ids if x and x != host_agent.id]
+    explicit_agents = _explicit_agent_override(db, org, text_in)
+    if explicit_agents:
+        target_agents: List[Agent] = explicit_agents
+    else:
+        linked_ids = get_linked_agent_ids(db, org, host_agent.id)
+        ordered_ids = [host_agent.id] + [x for x in linked_ids if x and x != host_agent.id]
 
-    target_agents: List[Agent] = []
-    if ordered_ids:
-        rows = db.execute(
-            select(Agent).where(
-                Agent.org_slug == org,
-                Agent.id.in_(ordered_ids),
-            )
-        ).scalars().all()
-        by_id = {a.id: a for a in rows}
-        target_agents = [by_id[x] for x in ordered_ids if x in by_id]
+        target_agents: List[Agent] = []
+        if ordered_ids:
+            rows = db.execute(
+                select(Agent).where(
+                    Agent.org_slug == org,
+                    Agent.id.in_(ordered_ids),
+                )
+            ).scalars().all()
+            by_id = {a.id: a for a in rows}
+            target_agents = [by_id[x] for x in ordered_ids if x in by_id]
 
-    if not target_agents:
-        target_agents = [host_agent]
+        if not target_agents:
+            target_agents = [host_agent]
 
     requested_names = _detect_requested_agent_names(text_in)
 
