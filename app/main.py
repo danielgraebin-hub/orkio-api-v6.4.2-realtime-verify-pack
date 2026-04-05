@@ -7633,8 +7633,25 @@ def _run_realtime_multi_agent_turn(
     requested_names = _detect_requested_agent_names(text_in)
 
     if requested_names:
-        filtered = [a for a in target_agents if (a.name or "") in requested_names]
-        if filtered:
+        requested_norm = [x.strip().lower() for x in requested_names]
+
+        filtered = [
+            a for a in target_agents
+            if (a.name or "").strip().lower() in requested_norm
+        ]
+
+        if not filtered:
+            # fallback crítico: busca direta por nome se AgentLink não estiver configurado
+            fallback_agents = db.execute(
+                select(Agent).where(
+                    Agent.org_slug == org,
+                    Agent.name.in_(requested_names),
+                )
+            ).scalars().all()
+
+            if fallback_agents:
+                target_agents = fallback_agents
+        else:
             # When the user explicitly requests specialists, skip host-only answer and bring them immediately.
             target_agents = filtered
     elif len(target_agents) > 1:
