@@ -259,20 +259,37 @@ class RealtimeSession(Base):
 class RealtimeEvent(Base):
     __tablename__ = "realtime_events"
     __table_args__ = (
-        Index("ux_realtime_events_org_sess_client_eid", "org_slug", "session_id", "client_event_id", unique=True),
+        Index(
+            "ux_realtime_events_org_sess_client_eid",
+            "org_slug",
+            "session_id",
+            "client_event_id",
+            unique=True,
+        ),
     )
+
     id = Column(String, primary_key=True)
     org_slug = Column(String, index=True, nullable=False)
+
     session_id = Column(String, index=True, nullable=False)
     thread_id = Column(String, index=True, nullable=False)
-    role = Column(String, nullable=False)
+
+    # Schema-aligned fields (Railway production DB)
+    speaker_type = Column(String, nullable=False)
+    speaker_id = Column(String, nullable=True)
+
     agent_id = Column(String, nullable=True)
     agent_name = Column(String, nullable=True)
+
     event_type = Column(String, nullable=False)
-    content = Column(Text, nullable=True)
+
+    transcript_raw = Column(Text, nullable=True)
     transcript_punct = Column(Text, nullable=True)
+
     created_at = Column(BigInteger, nullable=False)
+
     client_event_id = Column(String, nullable=True)
+
     meta = Column(Text, nullable=True)
 
 
