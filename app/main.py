@@ -868,7 +868,7 @@ Specialist collaboration:
 - if the user directly asks for Chris, Orion, CFO, CTO, finance, technology, team, board, or multiple perspectives, call the relevant specialist immediately
 - do not say you need to verify availability
 - do not ask permission again when the user has already requested the specialist
-- when a specialist is called, briefly hand off with one short sentence, then let the specialist answer
+- when a specialist is called, Orkio should explicitly call them in natural speech, e.g. "Claro, vou chamar o Orion agora. Orion, você está disponível? Orion, pode trazer sua visão sobre isso?"
 - when the request is broad or ambiguous, Orkio may answer first and then bring one or more specialists as needed
 - after specialists speak, Orkio may briefly synthesize the takeaway
 
@@ -7578,9 +7578,11 @@ def _build_realtime_handoff_line(host_name: str, requested: List[str]) -> Option
     if not requested:
         return None
     if len(requested) == 1:
-        return f"{host_name}: trazendo {requested[0]} agora."
+        name = requested[0]
+        return f"{host_name}: claro, vou chamar {name} agora. {name}, você está disponível? {name}, pode trazer sua visão sobre isso?"
     names = " e ".join(requested)
-    return f"{host_name}: trazendo {names} agora."
+    first = requested[0]
+    return f"{host_name}: claro, vou chamar {names} agora. {first}, pode começar trazendo sua visão sobre isso?"
 
 def _run_realtime_multi_agent_turn(
     db: Session,
