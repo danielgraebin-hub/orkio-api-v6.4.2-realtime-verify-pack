@@ -7701,12 +7701,11 @@ def _detect_requested_agent_names(message: str) -> List[str]:
 def _build_realtime_handoff_line(host_name: str, requested: List[str]) -> Optional[str]:
     if not requested:
         return None
-    if len(requested) == 1:
-        name = requested[0]
-        return f"{host_name}: claro, vou chamar {name} agora. {name}, você está disponível? {name}, pode trazer sua visão sobre isso?"
-    names = " e ".join(requested)
+    # Keep handoff short to avoid adding another long concurrent turn.
     first = requested[0]
-    return f"{host_name}: claro, vou chamar {names} agora. {first}, pode começar trazendo sua visão sobre isso?"
+    if len(requested) == 1:
+        return f"{host_name}: claro, vou chamar {first} agora."
+    return f"{host_name}: claro, vou começar com {first} agora."
 
 
 def _explicit_agent_override(db: Session, org: str, text: str) -> List[Agent]:
@@ -7823,9 +7822,13 @@ def _run_realtime_multi_agent_turn(
         else:
             # When the user explicitly requests specialists, skip host-only answer and bring them immediately.
             target_agents = filtered
-    elif len(target_agents) > 1:
-        # Default behavior: host + linked agents remains allowed when team mode exists.
-        pass
+
+    # Realtime turn-taking policy:
+    # - explicit single specialist -> only that specialist speaks
+    # - explicit multi/team/board -> only one specialist speaks per realtime turn
+    # - default multi-agent team mode -> also limit to one specialist per turn
+    if len(target_agents) > 1:
+        target_agents = target_agents[:1]
 
     tid = rs.thread_id
     uid = user.get("sub")
