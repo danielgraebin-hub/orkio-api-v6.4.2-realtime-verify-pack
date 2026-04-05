@@ -703,6 +703,87 @@ def get_agent_file_ids(db: Session, org: str, agent_ids: List[str]) -> List[str]
     ).all()
     return [r[0] for r in rows if r and r[0]]
 
+
+
+def _parse_agent_ids_payload(value: Optional[str]) -> List[str]:
+    raw = (value or "").strip()
+    if not raw:
+        return []
+    out: List[str] = []
+    try:
+        if raw.startswith("["):
+            data = json.loads(raw)
+            if isinstance(data, list):
+                out = [str(x).strip() for x in data if str(x).strip()]
+        else:
+            out = [x.strip() for x in raw.split(",") if x.strip()]
+    except Exception:
+        out = [x.strip() for x in raw.split(",") if x.strip()]
+    return list(dict.fromkeys(out))
+
+
+def _fallback_plaintext_extract(filename: str, raw: bytes, mime_type: Optional[str]) -> str:
+    name = (filename or "").strip().lower()
+    mime = (mime_type or "").strip().lower()
+    text_exts = (
+        ".txt", ".md", ".markdown", ".csv", ".json", ".py", ".js", ".ts", ".jsx", ".tsx",
+        ".html", ".htm", ".css", ".sql", ".xml", ".yaml", ".yml", ".log"
+    )
+    if not (mime.startswith("text/") or name.endswith(text_exts) or mime in {"application/json", "text/csv"}):
+        return ""
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            return raw.decode(enc, errors="ignore").strip()
+        except Exception:
+            continue
+    return ""
+
+
+def _extract_text_with_fallback(filename: str, raw: bytes, mime_type: Optional[str]) -> tuple[str, int]:
+    text_content = ""
+    extracted_chars = 0
+    try:
+        text_content, extracted_chars = extract_text(filename, raw)
+    except Exception:
+        logger.exception("EXTRACT_TEXT_FAILED filename=%s", filename)
+        text_content, extracted_chars = "", 0
+
+    if not (text_content or "").strip():
+        fallback = _fallback_plaintext_extract(filename, raw, mime_type)
+        if fallback:
+            text_content = fallback
+            extracted_chars = len(fallback)
+            logger.info("EXTRACT_TEXT_FALLBACK_OK filename=%s extracted_chars=%s", filename, extracted_chars)
+
+    return (text_content or "").strip(), int(extracted_chars or 0)
+
+
+def _create_file_chunks(db: Session, *, org: str, file_id: str, text_content: str) -> int:
+    chunk_chars = int(os.getenv("RAG_CHUNK_CHARS", "1200"))
+    overlap = int(os.getenv("RAG_CHUNK_OVERLAP", "200"))
+    text_len = len(text_content or "")
+    idx = 0
+    pos = 0
+    created = 0
+    while pos < text_len:
+        end = min(text_len, pos + chunk_chars)
+        chunk = (text_content[pos:end] or "").strip()
+        if chunk:
+            db.add(FileChunk(id=new_id(), org_slug=org, file_id=file_id, idx=idx, content=chunk, created_at=now_ts()))
+            idx += 1
+            created += 1
+        if end >= text_len:
+            break
+        pos = max(0, end - overlap)
+    return created
+
+
+def _log_upload_stage(stage: str, **meta: Any) -> None:
+    try:
+        logger.info("%s %s", stage, json.dumps(meta, ensure_ascii=False, default=str))
+    except Exception:
+        logger.info("%s %s", stage, meta)
+
 def get_org(x_org_slug: Optional[str]) -> str:
     if tenant_mode() == "single":
         return default_tenant()
@@ -4839,9 +4920,11 @@ async def upload(
     uid = user.get("sub")
     try:
         filename = file.filename or "upload"
+        _log_upload_stage("UPLOAD_RECEIVED", org=org, user_id=uid, filename=filename, intent=intent, thread_id=thread_id, agent_id=agent_id, agent_ids=agent_ids)
+
         limit_bytes = MAX_UPLOAD_MB * 1024 * 1024
         size = 0
-        chunks = []
+        chunks: List[bytes] = []
         while True:
             chunk = await file.read(1024 * 1024)
             if not chunk:
@@ -4852,57 +4935,60 @@ async def upload(
             chunks.append(chunk)
         raw = b"".join(chunks)
 
-        # PATCH0100_14: ACL check for thread uploads
-        if thread_id and user.get("role") != "admin":
-            _require_thread_member(db, org, thread_id, uid)
-
         resolved_agent_id = (agent_id or x_agent_id)
-        # Parse multi-agent list (comma-separated IDs)
-        resolved_agent_ids = []
-        if agent_ids:
-            try:
-                resolved_agent_ids = [a.strip() for a in (agent_ids or "").split(",") if a.strip()]
-            except Exception:
-                resolved_agent_ids = []
+        resolved_agent_ids = _parse_agent_ids_payload(agent_ids)
 
-        effective_intent = (intent or '').strip().lower() or ('agent' if (link_agent and resolved_agent_id) else 'chat')
-        # Normalize intent
-        if effective_intent == 'chat':
-            # Chat intent is temporary; never link to agent knowledge
+        effective_intent = (intent or "").strip().lower() or ("agent" if (link_agent and resolved_agent_id) else "chat")
+        if effective_intent == "chat":
             link_agent = False
+        if effective_intent not in ("chat", "agent", "institutional"):
+            effective_intent = "agent" if (link_agent and resolved_agent_id) else "chat"
 
-        if effective_intent not in ('chat','agent','institutional'):
-            effective_intent = 'agent' if (link_agent and resolved_agent_id) else 'chat'
-
-        is_institutional = (effective_intent == 'institutional')
-        # Institutional B2 flow:
-        # - Admin can upload as institutional directly
-        # - Non-admin can request institutionalization; file remains available (thread-scoped) until approved
         is_admin_user = (user.get("role") == "admin")
-
         if link_all_agents:
-            effective_intent = 'institutional'
+            effective_intent = "institutional"
 
+        is_institutional = (effective_intent == "institutional")
         create_request = False
-        if (effective_intent == 'institutional' or institutional_request) and (not is_admin_user):
+        if (effective_intent == "institutional" or institutional_request) and (not is_admin_user):
             create_request = True
-            effective_intent = 'chat'
+            effective_intent = "chat"
             is_institutional = False
-        elif (effective_intent == 'institutional') and is_admin_user:
+        elif (effective_intent == "institutional") and is_admin_user:
             is_institutional = True
+
+        effective_thread_id = (thread_id or "").strip() or None
+        if effective_intent == "chat" and not effective_thread_id:
+            t = Thread(
+                id=new_id(),
+                org_slug=org,
+                title="Nova conversa",
+                created_at=now_ts(),
+            )
+            db.add(t)
+            db.commit()
+            effective_thread_id = t.id
+            try:
+                _ensure_thread_owner(db, org, t.id, uid)
+            except Exception:
+                logger.exception("UPLOAD_THREAD_OWNER_ENSURE_FAILED thread_id=%s user_id=%s", t.id, uid)
+            _log_upload_stage("UPLOAD_THREAD_AUTO_CREATED", thread_id=effective_thread_id, user_id=uid)
+
+        if effective_thread_id and user.get("role") != "admin":
+            _require_thread_member(db, org, effective_thread_id, uid)
 
         f = File(
             id=new_id(),
             org_slug=org,
-            thread_id=thread_id if effective_intent == 'chat' else None,
+            thread_id=effective_thread_id if effective_intent == "chat" else None,
             uploader_id=user.get("sub"),
             uploader_name=user.get("name"),
             uploader_email=user.get("email"),
             filename=filename,
             original_filename=filename,
             origin=effective_intent,
-            scope_thread_id=thread_id if effective_intent == 'chat' else None,
-            scope_agent_id=resolved_agent_id if effective_intent == 'agent' else None,
+            scope_thread_id=effective_thread_id if effective_intent == "chat" else None,
+            scope_agent_id=resolved_agent_id if effective_intent == "agent" else None,
             mime_type=file.content_type,
             size_bytes=len(raw),
             content=raw,
@@ -4912,25 +4998,24 @@ async def upload(
         )
         db.add(f)
         db.commit()
+        _log_upload_stage("UPLOAD_SAVED", file_id=f.id, filename=f.filename, size_bytes=f.size_bytes, origin=effective_intent, thread_id=effective_thread_id)
 
-        # Create chat-visible upload event immediately (thread intent)
-        if thread_id:
+        if effective_thread_id:
             try:
                 ts = now_ts()
                 who = (user.get("name") or user.get("email") or "Usuário")
                 email = (user.get("email") or "")
-                # PATCH0100_14: DOC INSTITUCIONAL format
                 when_iso = time.strftime("%Y-%m-%d", time.gmtime(int(ts)))
                 when_time = time.strftime("%H:%M", time.gmtime(int(ts)))
                 size_kb = round(len(raw) / 1024, 1)
-                if is_institutional or effective_intent == 'institutional':
+                if is_institutional or effective_intent == "institutional":
                     visible_text = f"📎 DOC INSTITUCIONAL — {when_iso} {when_time} — {who} ({email}) enviou: {filename} — {size_kb} KB"
                 else:
                     visible_text = f"📎 Upload: \"{filename}\" • por {who}{(' / ' + email) if (email and email not in who) else ''} • {when_iso} {when_time} — {size_kb} KB"
                 payload = {
                     "kind": "upload",
                     "type": "file_upload",
-                    "scope": "institutional" if (is_institutional or effective_intent == 'institutional') else effective_intent,
+                    "scope": "institutional" if (is_institutional or effective_intent == "institutional") else effective_intent,
                     "agent_id": resolved_agent_id,
                     "agent_ids": resolved_agent_ids,
                     "institutional_request": bool(institutional_request),
@@ -4949,7 +5034,7 @@ async def upload(
                 ev = Message(
                     id=new_id(),
                     org_slug=org,
-                    thread_id=thread_id,
+                    thread_id=effective_thread_id,
                     user_id=user.get("sub"),
                     user_name=who,
                     role="system",
@@ -4958,20 +5043,11 @@ async def upload(
                 )
                 db.add(ev)
                 db.commit()
-                try:
-                    audit(db, org, user.get("sub"), "chat.file.uploaded", request_id="upload", path="/api/files/upload", status_code=200, latency_ms=0,
-                          meta={"thread_id": thread_id, "file_id": f.id, "filename": f.filename, "uploader_email": user.get("email"), "ts": ts})
-                except Exception:
-                    logger.exception("AUDIT_UPLOAD_CHAT_FAILED")
+                _log_upload_stage("UPLOAD_THREAD_EVENT_OK", thread_id=effective_thread_id, file_id=f.id)
             except Exception:
                 logger.exception("UPLOAD_CHAT_EVENT_FAILED")
-            else:
-                logger.info("UPLOAD_CHAT_EVENT_CREATED_OK thread=%s file=%s", thread_id, f.filename)
 
-
-        # Link file to agent knowledge based on selection
         try:
-            # Institutional (admin): link to ALL agents in the org
             if is_institutional and is_admin_user:
                 ensure_core_agents(db, org)
                 all_agents = db.execute(select(Agent).where(Agent.org_slug == org)).scalars().all()
@@ -4986,9 +5062,10 @@ async def upload(
                     if not existing:
                         db.add(AgentKnowledge(id=new_id(), org_slug=org, agent_id=ag.id, file_id=f.id, created_at=now_ts()))
                 db.commit()
+                _log_upload_stage("UPLOAD_LINKED_ALL_AGENTS", file_id=f.id, count=len(all_agents))
 
-            # Explicit multi-agent linking
             if resolved_agent_ids:
+                linked = 0
                 for aid in resolved_agent_ids:
                     ag = db.get(Agent, aid)
                     if not ag or ag.org_slug != org:
@@ -5002,9 +5079,10 @@ async def upload(
                     ).scalar_one_or_none()
                     if not existing:
                         db.add(AgentKnowledge(id=new_id(), org_slug=org, agent_id=ag.id, file_id=f.id, created_at=now_ts()))
+                        linked += 1
                 db.commit()
+                _log_upload_stage("UPLOAD_LINKED_MULTI_AGENT", file_id=f.id, count=linked, agent_ids=resolved_agent_ids)
 
-            # Single-agent link (legacy)
             if link_agent and resolved_agent_id:
                 ag = db.get(Agent, resolved_agent_id)
                 if ag and ag.org_slug == org:
@@ -5018,10 +5096,10 @@ async def upload(
                     if not existing:
                         db.add(AgentKnowledge(id=new_id(), org_slug=org, agent_id=ag.id, file_id=f.id, created_at=now_ts()))
                     db.commit()
+                    _log_upload_stage("UPLOAD_LINKED_SINGLE_AGENT", file_id=f.id, agent_id=resolved_agent_id)
         except Exception:
-            pass
+            logger.exception("UPLOAD_AGENT_LINK_FAILED file_id=%s", f.id)
 
-        # Non-admin institutional request: create a pending approval record
         if create_request:
             try:
                 db.add(FileRequest(
@@ -5036,45 +5114,43 @@ async def upload(
                     resolved_by_admin_id=None,
                 ))
                 db.commit()
+                _log_upload_stage("UPLOAD_INSTITUTIONAL_REQUEST_CREATED", file_id=f.id, user_id=uid)
             except Exception:
-                pass
+                logger.exception("UPLOAD_FILE_REQUEST_FAILED file_id=%s", f.id)
 
         extracted_chars = 0
         text_content = ""
+        chunks_created = 0
         try:
-            text_content, extracted_chars = extract_text(filename, raw)
-            ft = FileText(id=new_id(), org_slug=org, file_id=f.id, text=text_content, extracted_chars=extracted_chars, created_at=now_ts())
-            db.add(ft)
-
-            # Chunking (deterministic)
-            chunk_chars = int(os.getenv("RAG_CHUNK_CHARS", "1200"))
-            overlap = int(os.getenv("RAG_CHUNK_OVERLAP", "200"))
-            text_len = len(text_content)
-            idx = 0
-            pos = 0
-            while pos < text_len:
-                end = min(text_len, pos + chunk_chars)
-                chunk = text_content[pos:end].strip()
-                if chunk:
-                    db.add(FileChunk(id=new_id(), org_slug=org, file_id=f.id, idx=idx, content=chunk, created_at=now_ts()))
-                    idx += 1
-                if end >= text_len:
-                    break
-                pos = max(0, end - overlap)
-
-            db.commit()
+            _log_upload_stage("EXTRACT_TEXT_STARTED", file_id=f.id, filename=f.filename, mime_type=f.mime_type)
+            text_content, extracted_chars = _extract_text_with_fallback(filename, raw, file.content_type)
+            if text_content:
+                ft = FileText(id=new_id(), org_slug=org, file_id=f.id, text=text_content, extracted_chars=extracted_chars, created_at=now_ts())
+                db.add(ft)
+                chunks_created = _create_file_chunks(db, org=org, file_id=f.id, text_content=text_content)
+                db.commit()
+                _log_upload_stage("CHUNKING_DONE", file_id=f.id, extracted_chars=extracted_chars, chunks_created=chunks_created)
+            else:
+                f.extraction_failed = True
+                db.add(f)
+                db.commit()
+                _log_upload_stage("EXTRACT_TEXT_EMPTY", file_id=f.id, filename=f.filename)
         except Exception:
+            logger.exception("UPLOAD_EXTRACT_OR_CHUNK_FAILED file_id=%s", f.id)
+            try:
+                db.rollback()
+            except Exception:
+                pass
             f.extraction_failed = True
             db.add(f)
             db.commit()
 
-        # If this is a thread-scoped upload (intent=chat), create a system message so the UI shows the attachment.
         try:
-            if effective_intent == 'chat' and thread_id:
+            if effective_intent == "chat" and effective_thread_id:
                 m_up = Message(
                     id=new_id(),
                     org_slug=org,
-                    thread_id=thread_id,
+                    thread_id=effective_thread_id,
                     role="system",
                     content=f"📎 Arquivo anexado: {f.filename}",
                     agent_name="system",
@@ -5082,24 +5158,51 @@ async def upload(
                 )
                 db.add(m_up)
                 db.commit()
+            _log_upload_stage("FILE_REGISTERED", file_id=f.id, extraction_failed=bool(getattr(f, "extraction_failed", False)), thread_id=effective_thread_id)
         except Exception:
             try:
                 db.rollback()
             except Exception:
                 pass
 
-        # (Upload event is created immediately after file commit for thread uploads.)
-
-        # Audit high-value event
         try:
-            audit(db=db, org_slug=org, user_id=user.get("sub"), action="file.uploaded", request_id=new_id(), path="/api/files/upload", status_code=200, latency_ms=0, meta={"filename": f.filename, "size_bytes": f.size_bytes, "intent": effective_intent, "thread_id": thread_id})
+            audit(
+                db=db,
+                org_slug=org,
+                user_id=user.get("sub"),
+                action="file.uploaded",
+                request_id=new_id(),
+                path="/api/files/upload",
+                status_code=200,
+                latency_ms=0,
+                meta={
+                    "filename": f.filename,
+                    "size_bytes": f.size_bytes,
+                    "intent": effective_intent,
+                    "thread_id": effective_thread_id,
+                    "file_id": f.id,
+                    "chunks_created": chunks_created,
+                    "extraction_failed": bool(getattr(f, "extraction_failed", False)),
+                },
+            )
         except Exception:
             pass
 
-        return {"file_id": f.id, "filename": f.filename, "status": "stored", "extracted_chars": extracted_chars}
+        return {
+            "file_id": f.id,
+            "filename": f.filename,
+            "status": "stored",
+            "thread_id": effective_thread_id,
+            "extracted_chars": extracted_chars,
+            "chunks_created": chunks_created,
+            "extraction_failed": bool(getattr(f, "extraction_failed", False)),
+            "linked_agent_ids": resolved_agent_ids,
+            "linked_agent_id": resolved_agent_id,
+        }
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("UPLOAD_FAILED filename=%s", getattr(file, "filename", None))
         raise HTTPException(status_code=400, detail=f"upload_failed: {e.__class__.__name__}: {str(e)}")
 
 @app.get("/api/files")
@@ -5592,8 +5695,11 @@ async def admin_upload_file(file: UploadFile = UpFile(...), x_org_slug: Optional
     org = get_org(x_org_slug)
     filename = file.filename or "upload"
     raw = await file.read()
-    if len(raw) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Arquivo muito grande (max 10MB)")
+    limit_bytes = MAX_UPLOAD_MB * 1024 * 1024
+    if len(raw) > limit_bytes:
+        raise HTTPException(status_code=413, detail=f"Arquivo muito grande (max {MAX_UPLOAD_MB}MB)")
+
+    _log_upload_stage("UPLOAD_RECEIVED", org=org, user_id=admin.get("sub"), filename=filename, intent="institutional-admin")
 
     f = File(
         id=new_id(),
@@ -5614,37 +5720,35 @@ async def admin_upload_file(file: UploadFile = UpFile(...), x_org_slug: Optional
     )
     db.add(f)
     db.commit()
+    _log_upload_stage("UPLOAD_SAVED", file_id=f.id, filename=f.filename, size_bytes=f.size_bytes, origin="institutional")
 
     extracted_chars = 0
     text_content = ""
+    chunks_created = 0
     try:
-        text_content, extracted_chars = extract_text(filename, raw)
-        ft = FileText(id=new_id(), org_slug=org, file_id=f.id, text=text_content, extracted_chars=extracted_chars, created_at=now_ts())
-        db.add(ft)
-
-        # Chunking (deterministic)
-        chunk_chars = int(os.getenv("RAG_CHUNK_CHARS", "1200"))
-        overlap = int(os.getenv("RAG_CHUNK_OVERLAP", "200"))
-        text_len = len(text_content)
-        idx = 0
-        pos = 0
-        while pos < text_len:
-            end = min(text_len, pos + chunk_chars)
-            chunk = text_content[pos:end].strip()
-            if chunk:
-                db.add(FileChunk(id=new_id(), org_slug=org, file_id=f.id, idx=idx, content=chunk, created_at=now_ts()))
-                idx += 1
-            if end >= text_len:
-                break
-            pos = max(0, end - overlap)
-
-        db.commit()
+        _log_upload_stage("EXTRACT_TEXT_STARTED", file_id=f.id, filename=f.filename, mime_type=f.mime_type)
+        text_content, extracted_chars = _extract_text_with_fallback(filename, raw, file.content_type)
+        if text_content:
+            ft = FileText(id=new_id(), org_slug=org, file_id=f.id, text=text_content, extracted_chars=extracted_chars, created_at=now_ts())
+            db.add(ft)
+            chunks_created = _create_file_chunks(db, org=org, file_id=f.id, text_content=text_content)
+            db.commit()
+            _log_upload_stage("CHUNKING_DONE", file_id=f.id, extracted_chars=extracted_chars, chunks_created=chunks_created)
+        else:
+            f.extraction_failed = True
+            db.add(f)
+            db.commit()
+            _log_upload_stage("EXTRACT_TEXT_EMPTY", file_id=f.id, filename=f.filename)
     except Exception:
+        logger.exception("ADMIN_UPLOAD_EXTRACT_OR_CHUNK_FAILED file_id=%s", f.id)
+        try:
+            db.rollback()
+        except Exception:
+            pass
         f.extraction_failed = True
         db.add(f)
         db.commit()
 
-    # PATCH0100_14 (Pilar B, Caso 2): Register upload in institutional thread
     try:
         inst_title = "📚 Documentos Institucionais"
         inst_thread = db.execute(
@@ -5654,17 +5758,12 @@ async def admin_upload_file(file: UploadFile = UpFile(...), x_org_slug: Optional
             inst_thread = Thread(id=new_id(), org_slug=org, title=inst_title, created_at=now_ts())
             db.add(inst_thread)
             db.commit()
-            # Uploader becomes owner of institutional thread
             admin_uid = admin.get("sub")
             if admin_uid:
                 _ensure_thread_owner(db, org, inst_thread.id, admin_uid)
-        # Create DOC INSTITUCIONAL message
         ts = now_ts()
         who = admin.get("name") or "admin"
         adm_email = admin.get("email") or ""
-        when_iso = time.strftime("%Y-%m-%d", time.gmtime(int(ts)))
-        when_time = time.strftime("%H:%M", time.gmtime(int(ts)))
-        size_kb = round(len(raw) / 1024, 1)
         visible_text = f"📎 Documento institucional anexado: {filename}"
         inst_payload = {
             "kind": "upload", "type": "file_upload", "scope": "institutional",
@@ -5682,16 +5781,41 @@ async def admin_upload_file(file: UploadFile = UpFile(...), x_org_slug: Optional
         )
         db.add(ev)
         db.commit()
+        _log_upload_stage("FILE_REGISTERED", file_id=f.id, extraction_failed=bool(getattr(f, "extraction_failed", False)), thread_id=inst_thread.id)
     except Exception:
         logger.exception("INSTITUTIONAL_THREAD_EVENT_FAILED")
 
-    # audit
     try:
-        audit(db, org_slug=org, user_id=None, action="admin_file_upload", request_id="admin", path="/api/admin/files/upload", status_code=200, latency_ms=0, meta={"file_id": f.id, "filename": f.filename, "is_institutional": True})
+        audit(
+            db,
+            org_slug=org,
+            user_id=None,
+            action="admin_file_upload",
+            request_id="admin",
+            path="/api/admin/files/upload",
+            status_code=200,
+            latency_ms=0,
+            meta={
+                "file_id": f.id,
+                "filename": f.filename,
+                "is_institutional": True,
+                "chunks_created": chunks_created,
+                "extraction_failed": bool(getattr(f, "extraction_failed", False)),
+            },
+        )
     except Exception:
         pass
 
-    return {"file_id": f.id, "filename": f.filename, "status": "stored", "is_institutional": True, "extracted_chars": extracted_chars}
+    return {
+        "file_id": f.id,
+        "filename": f.filename,
+        "status": "stored",
+        "is_institutional": True,
+        "extracted_chars": extracted_chars,
+        "chunks_created": chunks_created,
+        "extraction_failed": bool(getattr(f, "extraction_failed", False)),
+    }
+
 @app.get("/api/admin/costs/health")
 def admin_costs_health(_admin=Depends(require_admin_access), x_org_slug: Optional[str] = Header(default=None), db: Session = Depends(get_db)):
     org = get_org(x_org_slug)
@@ -7655,6 +7779,7 @@ def _run_realtime_multi_agent_turn(
 
     explicit_agents = _explicit_agent_override(db, org, text_in)
     if explicit_agents:
+        logger.info("REALTIME_EXPLICIT_AGENT_OVERRIDE session_id=%s requested=%s resolved=%s", rs.id, text_in, [getattr(a, "name", None) for a in explicit_agents])
         target_agents: List[Agent] = explicit_agents
     else:
         linked_ids = get_linked_agent_ids(db, org, host_agent.id)
@@ -7821,7 +7946,9 @@ def _run_realtime_multi_agent_turn(
         answer = (ans_obj or {}).get("text") or ""
         answer = answer.strip()
         if not answer:
+            logger.warning("REALTIME_AGENT_EMPTY_ANSWER session_id=%s agent=%s", rs.id, getattr(agent, "name", None))
             continue
+        logger.info("REALTIME_AGENT_ANSWER_READY session_id=%s agent=%s chars=%s", rs.id, getattr(agent, "name", None), len(answer))
 
         m_ass = Message(
             id=new_id(),
@@ -8300,6 +8427,31 @@ def realtime_get_session(
                 punct_ready += 1
         out_events.append(d)
 
+    live_assistant_messages = []
+    try:
+        msgs = db.execute(
+            select(Message)
+            .where(
+                Message.org_slug == org,
+                Message.thread_id == rs.thread_id,
+                Message.role == "assistant",
+                Message.created_at >= int(rs.started_at or 0),
+            )
+            .order_by(Message.created_at.asc())
+        ).scalars().all()
+        live_assistant_messages = [
+            {
+                "id": m.id,
+                "agent_id": getattr(m, "agent_id", None),
+                "agent_name": getattr(m, "agent_name", None),
+                "content": getattr(m, "content", None),
+                "created_at": getattr(m, "created_at", None),
+            }
+            for m in msgs
+        ]
+    except Exception:
+        logger.exception("REALTIME_LIVE_MESSAGES_LOAD_FAILED session_id=%s", session_id)
+
     return {
         "session": {
             "id": rs.id,
@@ -8315,6 +8467,7 @@ def realtime_get_session(
             "meta": meta,
         },
         "events": out_events,
+        "live_assistant_messages": live_assistant_messages,
         "punct": {"total": punct_total, "ready": punct_ready, "done": (punct_total > 0 and punct_ready == punct_total)},
     }
 
