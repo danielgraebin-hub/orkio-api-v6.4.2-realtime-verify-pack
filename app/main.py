@@ -7196,6 +7196,126 @@ class RealtimeEndReq(BaseModel):
     meta: Optional[Dict[str, Any]] = None
 
 
+
+def _normalize_realtime_speaker_type(role: Optional[str]) -> str:
+    r = (role or "").strip().lower()
+    if r == "user":
+        return "user"
+    if r in {"assistant", "agent", "host"}:
+        return "agent"
+    if r == "system":
+        return "system"
+    return "user"
+
+def _realtime_speaker_id_for_event(role: Optional[str], session_user_id: Optional[str], agent_id: Optional[str], fallback_user_id: Optional[str]) -> Optional[str]:
+    speaker_type = _normalize_realtime_speaker_type(role)
+    if speaker_type == "agent":
+        return agent_id
+    if speaker_type == "user":
+        return session_user_id or fallback_user_id
+    return None
+
+def _insert_realtime_event_row(
+    db: Session,
+    *,
+    event_id: str,
+    org: str,
+    session_id: str,
+    thread_id: Optional[str],
+    role: Optional[str],
+    agent_id: Optional[str],
+    agent_name: Optional[str],
+    event_type: Optional[str],
+    content: Optional[str],
+    transcript_punct: Optional[str],
+    created_at: int,
+    client_event_id: Optional[str],
+    meta: Optional[Dict[str, Any]],
+    session_user_id: Optional[str],
+    fallback_user_id: Optional[str],
+) -> None:
+    speaker_type = _normalize_realtime_speaker_type(role)
+    speaker_id = _realtime_speaker_id_for_event(role, session_user_id, agent_id, fallback_user_id)
+    safe_content = (content or "")
+    meta_json = json.dumps(meta or {}, ensure_ascii=False) if meta is not None else None
+    db.execute(
+        text(
+            """
+            INSERT INTO realtime_events (
+                id,
+                org_slug,
+                session_id,
+                thread_id,
+                speaker_type,
+                speaker_id,
+                event_type,
+                transcript_raw,
+                transcript_punct,
+                created_at,
+                role,
+                agent_id,
+                agent_name,
+                content,
+                client_event_id,
+                meta
+            ) VALUES (
+                :id,
+                :org_slug,
+                :session_id,
+                :thread_id,
+                :speaker_type,
+                :speaker_id,
+                :event_type,
+                :transcript_raw,
+                :transcript_punct,
+                :created_at,
+                :role,
+                :agent_id,
+                :agent_name,
+                :content,
+                :client_event_id,
+                :meta
+            )
+            """
+        ),
+        {
+            "id": event_id,
+            "org_slug": org,
+            "session_id": session_id,
+            "thread_id": thread_id,
+            "speaker_type": speaker_type,
+            "speaker_id": speaker_id,
+            "event_type": event_type,
+            "transcript_raw": safe_content,
+            "transcript_punct": transcript_punct,
+            "created_at": int(created_at),
+            "role": (role or "").strip().lower() or None,
+            "agent_id": agent_id,
+            "agent_name": agent_name,
+            "content": safe_content,
+            "client_event_id": client_event_id,
+            "meta": meta_json,
+        },
+    )
+
+def _message_exists_by_client_message_id(db: Session, org: str, thread_id: str, client_message_id: Optional[str]) -> bool:
+    if not client_message_id:
+        return False
+    try:
+        existing = db.execute(
+            select(Message.id)
+            .where(
+                Message.org_slug == org,
+                Message.thread_id == thread_id,
+                Message.client_message_id == client_message_id,
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        return bool(existing)
+    except Exception:
+        return False
+
+
 class RealtimeGuardReq(BaseModel):
     thread_id: Optional[str] = None
     message: str = Field(min_length=1, max_length=4000)
@@ -7560,62 +7680,86 @@ def realtime_event(
         _require_thread_member(db, org, rs.thread_id, uid)
 
     ts = int(body.created_at or now_ts())
-    agent_id = rs.agent_id if body.role != "user" else None
-    agent_name = rs.agent_name if body.role != "user" else None
+    role = (body.role or "user").strip().lower() or "user"
+    agent_id = rs.agent_id if role != "user" else None
+    agent_name = rs.agent_name if role != "user" else None
+    client_eid = (getattr(body, "client_event_id", None) or "").strip() or None
 
-    ev = RealtimeEvent(
-        id=new_id(),
-        org_slug=org,
+    if client_eid:
+        existing_eid = db.execute(
+            select(RealtimeEvent.id)
+            .where(
+                RealtimeEvent.org_slug == org,
+                RealtimeEvent.session_id == rs.id,
+                RealtimeEvent.client_event_id == client_eid,
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        if existing_eid:
+            return {"ok": True, "deduped": True, "event_id": existing_eid}
+
+    ev_id = new_id()
+    _insert_realtime_event_row(
+        db,
+        event_id=ev_id,
+        org=org,
         session_id=rs.id,
         thread_id=rs.thread_id,
-        role=body.role,
+        role=role,
         agent_id=agent_id,
         agent_name=agent_name,
         event_type=body.event_type,
         content=(body.content or ""),
+        transcript_punct=None,
         created_at=ts,
-        meta=json.dumps(body.meta or {}),
+        client_event_id=client_eid,
+        meta=body.meta,
+        session_user_id=getattr(rs, "user_id", None),
+        fallback_user_id=uid,
     )
-    db.add(ev)
 
     # Also write to thread messages on final events
     if body.is_final and body.content:
-        if body.role == "user":
-            m = Message(
-                id=new_id(),
-                org_slug=org,
-                thread_id=rs.thread_id,
-                user_id=rs.user_id,
-                user_name=rs.user_name,
-                role="user",
-                content=body.content,
-                created_at=ts,
-            )
-        else:
-            m = Message(
-                id=new_id(),
-                org_slug=org,
-                thread_id=rs.thread_id,
-                user_id=None,
-                user_name=None,
-                role="assistant",
-                content=body.content,
-                agent_id=agent_id,
-                agent_name=agent_name,
-                created_at=ts,
-            )
-        db.add(m)
+        msg_client_id = f"rt-{client_eid}" if client_eid else None
+        if not _message_exists_by_client_message_id(db, org, rs.thread_id, msg_client_id):
+            if role == "user":
+                m = Message(
+                    id=new_id(),
+                    org_slug=org,
+                    thread_id=rs.thread_id,
+                    user_id=rs.user_id,
+                    user_name=rs.user_name,
+                    role="user",
+                    content=_sanitize_assistant_text(body.content),
+                    client_message_id=msg_client_id,
+                    created_at=ts,
+                )
+            else:
+                m = Message(
+                    id=new_id(),
+                    org_slug=org,
+                    thread_id=rs.thread_id,
+                    user_id=None,
+                    user_name=None,
+                    role="assistant",
+                    content=_sanitize_assistant_text(body.content),
+                    agent_id=agent_id,
+                    agent_name=agent_name,
+                    client_message_id=msg_client_id,
+                    created_at=ts,
+                )
+            db.add(m)
 
-    _audit_realtime_safe(db, org, uid, action="realtime.event", meta={"session_id": rs.id, "thread_id": rs.thread_id, "event_type": body.event_type, "role": body.role, "is_final": bool(body.is_final)})
+    _audit_realtime_safe(db, org, uid, action="realtime.event", meta={"session_id": rs.id, "thread_id": rs.thread_id, "event_type": body.event_type, "role": role, "is_final": bool(body.is_final)})
 
     db.commit()
     try:
         # Pontuação assíncrona somente para transcript.final
         if body.is_final and (body.event_type or "").strip() == "transcript.final":
-            background_tasks.add_task(punctuate_realtime_events, org, [ev.id])
+            background_tasks.add_task(punctuate_realtime_events, org, [ev_id])
     except Exception:
         pass
-    return {"ok": True}
+    return {"ok": True, "event_id": ev_id}
 
 
 
@@ -7647,18 +7791,18 @@ def realtime_events_batch(
         _require_thread_member(db, org, rs.thread_id, uid)
 
     now = int(now_ts())
-    ev_rows: List[RealtimeEvent] = []
-    message_rows: List[Message] = []
+    inserted_events = 0
+    inserted_messages = 0
     punct_ids: List[str] = []
 
     for item in body.events:
         ts = int(item.created_at or now)
-        agent_id = rs.agent_id if item.role != "user" else None
-        agent_name = rs.agent_name if item.role != "user" else None
+        role = (item.role or "user").strip().lower() or "user"
+        agent_id = rs.agent_id if role != "user" else None
+        agent_name = rs.agent_name if role != "user" else None
 
         client_eid = (getattr(item, "client_event_id", None) or "").strip() or None
         if client_eid:
-            # Idempotency: if this event was already persisted for this org+session+client_event_id, skip it.
             try:
                 existing_eid = db.execute(
                     select(RealtimeEvent.id)
@@ -7672,26 +7816,28 @@ def realtime_events_batch(
                 if existing_eid:
                     continue
             except Exception:
-                # If lookup fails, fall through and attempt insert.
                 pass
 
         eid = new_id()
-        ev_rows.append(
-            RealtimeEvent(
-                id=eid,
-                org_slug=org,
-                session_id=rs.id,
-                thread_id=rs.thread_id,
-                role=item.role,
-                agent_id=agent_id,
-                agent_name=agent_name,
-                event_type=item.event_type,
-                content=item.content,
-                created_at=ts,
-                client_event_id=client_eid,
-                meta=json.dumps(item.meta or {}, ensure_ascii=False) if item.meta is not None else None,
-            )
+        _insert_realtime_event_row(
+            db,
+            event_id=eid,
+            org=org,
+            session_id=rs.id,
+            thread_id=rs.thread_id,
+            role=role,
+            agent_id=agent_id,
+            agent_name=agent_name,
+            event_type=item.event_type,
+            content=item.content,
+            transcript_punct=None,
+            created_at=ts,
+            client_event_id=client_eid,
+            meta=item.meta,
+            session_user_id=getattr(rs, "user_id", None),
+            fallback_user_id=uid,
         )
+        inserted_events += 1
 
         try:
             event_type = (item.event_type or "").strip()
@@ -7699,28 +7845,26 @@ def realtime_events_batch(
             if item.is_final and event_type == "transcript.final":
                 punct_ids.append(eid)
             if item.is_final and content and event_type in ("transcript.final", "response.final"):
-                message_created_at = ts if isinstance(ts, int) and ts > 0 else int(now_ts())
-                message_rows.append(
-                    Message(
+                msg_client_id = f"rt-{client_eid}" if client_eid else None
+                if not _message_exists_by_client_message_id(db, org, rs.thread_id, msg_client_id):
+                    message_created_at = ts if isinstance(ts, int) and ts > 0 else int(now_ts())
+                    m = Message(
                         id=new_id(),
                         org_slug=org,
                         thread_id=rs.thread_id,
-                        user_id=rs.user_id if item.role == "user" else None,
-                        user_name=rs.user_name if item.role == "user" else None,
-                        role="user" if item.role == "user" else "assistant",
+                        user_id=rs.user_id if role == "user" else None,
+                        user_name=rs.user_name if role == "user" else None,
+                        role="user" if role == "user" else "assistant",
                         content=_sanitize_assistant_text(content),
-                        agent_id=agent_id if item.role != "user" else None,
-                        agent_name=agent_name if item.role != "user" else None,
+                        agent_id=agent_id if role != "user" else None,
+                        agent_name=agent_name if role != "user" else None,
+                        client_message_id=msg_client_id,
                         created_at=message_created_at,
                     )
-                )
+                    db.add(m)
+                    inserted_messages += 1
         except Exception:
             pass
-
-    if ev_rows:
-        db.add_all(ev_rows)
-    if message_rows:
-        db.add_all(message_rows)
 
     db.commit()
     try:
@@ -7728,7 +7872,7 @@ def realtime_events_batch(
             background_tasks.add_task(punctuate_realtime_events, org, punct_ids)
     except Exception:
         pass
-    return {"inserted_events": len(ev_rows), "inserted_messages": len(message_rows)}
+    return {"inserted_events": inserted_events, "inserted_messages": inserted_messages}
 
 
 @app.post("/api/realtime/end")
