@@ -80,14 +80,19 @@ def punctuate_realtime_events(org_slug: str, event_ids: Iterable[str]) -> None:
                 # Only punctuate finals; caller should filter, but keep safe here too
                 if not (ev.event_type or "").endswith(".final"):
                     continue
-                if not (ev.content or "").strip():
+                raw_text = (
+                    getattr(ev, "transcript_raw", None)
+                    or getattr(ev, "content", None)
+                    or ""
+                ).strip()
+                if not raw_text:
                     continue
                 # Idempotent
                 if getattr(ev, "transcript_punct", None):
                     continue
 
-                punct = _punctuate_with_openai(ev.content)
-                ev.transcript_punct = punct or ev.content
+                punct = _punctuate_with_openai(raw_text)
+                ev.transcript_punct = punct or raw_text
             except Exception:
                 # Never break the batch
                 logger.exception("punctuate_row_failed id=%s", getattr(ev, "id", None))
