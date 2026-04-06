@@ -47,17 +47,30 @@ def _reconcile_files_schema_boot():
         return
     try:
         with ENGINE.begin() as conn:
-            conn.execute(text(
-                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS thread_id VARCHAR"
-            ))
-            conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS ix_files_thread_id ON files(thread_id)"
-            ))
+            conn.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS thread_id VARCHAR"))
+            conn.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS filename VARCHAR"))
+            conn.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS mime_type VARCHAR"))
+            conn.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS size_bytes BIGINT"))
+            conn.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS storage_key VARCHAR"))
+            conn.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_id VARCHAR"))
+            conn.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_name VARCHAR"))
+            conn.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_email VARCHAR"))
+            conn.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS origin VARCHAR"))
+            conn.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS original_filename VARCHAR"))
+            conn.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS scope_thread_id VARCHAR"))
+            conn.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS scope_agent_id VARCHAR"))
+            conn.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS is_institutional BOOLEAN NOT NULL DEFAULT FALSE"))
+            conn.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS origin_thread_id VARCHAR"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_files_thread_id ON files(thread_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_files_scope_thread_id ON files(scope_thread_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_files_scope_agent_id ON files(scope_agent_id)"))
         print("FILES_SCHEMA_RECONCILE_DB_BOOT_OK")
     except Exception as e:
         print("FILES_SCHEMA_RECONCILE_DB_BOOT_FAILED", str(e))
 
+
 _reconcile_files_schema_boot()
+
 
 def get_db():
     if SessionLocal is None:
