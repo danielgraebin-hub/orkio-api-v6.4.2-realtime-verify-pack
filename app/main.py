@@ -1292,9 +1292,6 @@ def ensure_schema(db: Session):
         db.execute(text("ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS user_name VARCHAR"))
         db.execute(text("ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS agent_id VARCHAR"))
         db.execute(text("ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS agent_name VARCHAR"))
-        # Files schema reconcile hotfix (production drift)
-        db.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS thread_id VARCHAR"))
-        db.execute(text("CREATE INDEX IF NOT EXISTS ix_files_thread_id ON files(thread_id)"))
         # Files uploader provenance (PATCH0100_7)
         db.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_id VARCHAR"))
         db.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_name VARCHAR"))
@@ -1305,10 +1302,6 @@ def ensure_schema(db: Session):
         db.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS scope_agent_id VARCHAR"))
         db.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS is_institutional BOOLEAN NOT NULL DEFAULT FALSE"))
         db.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS origin_thread_id VARCHAR"))
-        db.execute(text("CREATE INDEX IF NOT EXISTS ix_files_org_slug ON files(org_slug)"))
-        db.execute(text("CREATE INDEX IF NOT EXISTS ix_files_scope_thread_id ON files(scope_thread_id)"))
-        db.execute(text("CREATE INDEX IF NOT EXISTS ix_files_scope_agent_id ON files(scope_agent_id)"))
-        db.execute(text("CREATE INDEX IF NOT EXISTS ix_files_origin ON files(origin)"))
         # FileChunks schema reconciliation (PATCH v6.3 drift fix)
         db.execute(text("ALTER TABLE IF EXISTS file_chunks ADD COLUMN IF NOT EXISTS idx INTEGER"))
         db.execute(text("ALTER TABLE IF EXISTS file_chunks ADD COLUMN IF NOT EXISTS agent_id VARCHAR"))
@@ -7730,53 +7723,23 @@ async def realtime_start(
 
 
 def _detect_requested_agent_names(message: str) -> List[str]:
-    """
-    Detecta apenas convocações explícitas.
-    Heurísticas amplas como "technical", "engineering", "arquitetura" e similares
-    NÃO devem convocar especialistas automaticamente.
-    """
     raw = (message or "").strip().lower()
     if not raw:
         return []
-
     requested: List[str] = []
-
-    explicit_patterns = [
-        ("Chris", [
-            r"@chris\b",
-            r"\bchris\b",
-            r"\bcfo\b",
-            r"chama\s+(a\s+)?chris\b",
-            r"chris,",
-            r"fale\s+chris\b",
-            r"responda\s+chris\b",
-        ]),
-        ("Orion", [
-            r"@orion\b",
-            r"\borion\b",
-            r"\bcto\b",
-            r"chama\s+(o\s+)?orion\b",
-            r"orion,",
-            r"fale\s+orion\b",
-            r"responda\s+orion\b",
-        ]),
+    patterns = [
+        ("Chris", [r"@chris\b", r"\bchris\b", r"\bcfo\b", r"financeir", r"financial", r"financ"]),
+        ("Orion", [r"@orion\b", r"\borion\b", r"\bcto\b", r"tecnolog", r"technical", r"arquitetur", r"engineering"]),
     ]
-
-    for name, pats in explicit_patterns:
+    for name, pats in patterns:
         for pat in pats:
             if re.search(pat, raw, flags=re.IGNORECASE):
                 requested.append(name)
                 break
-
-    if re.search(
-        r"@team\b|chama\s+(o\s+)?time\b|chama\s+(a\s+)?equipe\b|\btime\s+todo\b|\bequipe\s+inteira\b|\bboard\b|\bconselho\b|\bambos\b|\btodos\b",
-        raw,
-        flags=re.IGNORECASE,
-    ):
+    if re.search(r"@team\b|\bteam\b|\bequipe\b|\bboard\b|\bconselho\b|\bambos\b|\btodos\b", raw, flags=re.IGNORECASE):
         for name in ("Chris", "Orion"):
             if name not in requested:
                 requested.append(name)
-
     return requested
 
 def _build_realtime_handoff_line(host_name: str, requested: List[str]) -> Optional[str]:
@@ -7798,7 +7761,22 @@ def _explicit_agent_override(db: Session, org: str, text: str) -> List[Agent]:
     if not raw:
         return []
 
-    requested = _detect_requested_agent_names(raw)
+    requested: List[str] = []
+
+    patterns = {
+        "Orion": ["orion", "cto", "@orion"],
+        "Chris": ["chris", "cfo", "@chris"],
+    }
+
+    for canonical, aliases in patterns.items():
+        if any(alias in raw for alias in aliases):
+            requested.append(canonical)
+
+    if re.search(r"@team\b|\bteam\b|\bequipe\b|\bboard\b|\bconselho\b|\bambos\b|\btodos\b", raw, flags=re.IGNORECASE):
+        for canonical in ("Chris", "Orion"):
+            if canonical not in requested:
+                requested.append(canonical)
+
     if not requested:
         return []
 
@@ -7844,17 +7822,25 @@ def _run_realtime_multi_agent_turn(
 
     explicit_agents = _explicit_agent_override(db, org, text_in)
     if explicit_agents:
-        logger.info(
-            "REALTIME_EXPLICIT_AGENT_OVERRIDE session_id=%s requested=%s resolved=%s",
-            rs.id,
-            text_in,
-            [getattr(a, "name", None) for a in explicit_agents],
-        )
+        logger.info("REALTIME_EXPLICIT_AGENT_OVERRIDE session_id=%s requested=%s resolved=%s", rs.id, text_in, [getattr(a, "name", None) for a in explicit_agents])
         target_agents: List[Agent] = explicit_agents
     else:
-        # Política rígida:
-        # sem menção/comando explícito, apenas o host responde.
-        target_agents = [host_agent]
+        linked_ids = get_linked_agent_ids(db, org, host_agent.id)
+        ordered_ids = [host_agent.id] + [x for x in linked_ids if x and x != host_agent.id]
+
+        target_agents: List[Agent] = []
+        if ordered_ids:
+            rows = db.execute(
+                select(Agent).where(
+                    Agent.org_slug == org,
+                    Agent.id.in_(ordered_ids),
+                )
+            ).scalars().all()
+            by_id = {a.id: a for a in rows}
+            target_agents = [by_id[x] for x in ordered_ids if x in by_id]
+
+        if not target_agents:
+            target_agents = [host_agent]
 
     requested_names = _detect_requested_agent_names(text_in)
 
