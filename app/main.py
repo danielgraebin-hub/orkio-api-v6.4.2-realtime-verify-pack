@@ -866,48 +866,46 @@ def _seed_default_summit_codes(db: Session, org: str = "public") -> None:
 
 
 
-def _ensure_files_schema_hotfix(db: Session) -> None:
+def _normalize_voice_id(raw: Optional[str], *, default: str = "cedar") -> str:
+    voice = (raw or "").strip().lower()
+    aliases = {
+        "marine": "marin",
+        "marin": "marin",
+        "nova": "cedar",
+        "onyx": "echo",
+        "fable": "sage",
+    }
+    valid = {"alloy","ash","ballad","cedar","coral","echo","fable","marin","nova","onyx","sage","shimmer","verse"}
+    voice = aliases.get(voice, voice)
+    if voice in valid:
+        return voice
+    return (default or "cedar").strip().lower() or "cedar"
+
+def resolve_agent_voice(agent: Optional[Agent]) -> str:
     """
-    Emergency additive reconcile for production drift on table files.
-    Safe to run repeatedly. Must never crash startup.
+    Voice resolution priority:
+    1) agent.voice_id from admin/database
+    2) env fallback by canonical agent name
+    3) global default realtime/tts voice
     """
-    stmts = [
-        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS thread_id VARCHAR",
-        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_id VARCHAR",
-        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_name VARCHAR",
-        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_email VARCHAR",
-        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS origin VARCHAR",
-        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS original_filename VARCHAR",
-        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS scope_thread_id VARCHAR",
-        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS scope_agent_id VARCHAR",
-        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS is_institutional BOOLEAN NOT NULL DEFAULT FALSE",
-        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS origin_thread_id VARCHAR",
-        "CREATE INDEX IF NOT EXISTS ix_files_org_slug ON files(org_slug)",
-        "CREATE INDEX IF NOT EXISTS ix_files_thread_id ON files(thread_id)",
-        "CREATE INDEX IF NOT EXISTS ix_files_scope_thread_id ON files(scope_thread_id)",
-        "CREATE INDEX IF NOT EXISTS ix_files_scope_agent_id ON files(scope_agent_id)",
-        "CREATE INDEX IF NOT EXISTS ix_files_origin ON files(origin)",
-    ]
-    try:
-        for stmt in stmts:
-            try:
-                db.execute(text(stmt))
-            except Exception:
-                logger.exception("FILES_SCHEMA_HOTFIX_STMT_FAILED stmt=%s", stmt)
-        db.commit()
-        try:
-            logger.warning("FILES_SCHEMA_HOTFIX_APPLIED")
-        except Exception:
-            pass
-    except Exception:
-        try:
-            db.rollback()
-        except Exception:
-            pass
-        try:
-            logger.exception("FILES_SCHEMA_HOTFIX_FAILED")
-        except Exception:
-            pass
+    default_voice = _normalize_voice_id(
+        (os.getenv("OPENAI_REALTIME_VOICE_DEFAULT", "") or os.getenv("OPENAI_TTS_VOICE_DEFAULT", "cedar")),
+        default="cedar",
+    )
+
+    if not agent:
+        return default_voice
+
+    agent_name = ((getattr(agent, "name", None) or "")).strip().lower()
+    env_map = {
+        "orkio": os.getenv("ORKIO_VOICE_ID", "").strip(),
+        "chris": os.getenv("CHRIS_VOICE_ID", "").strip(),
+        "orion": os.getenv("ORION_VOICE_ID", "").strip(),
+    }
+
+    db_voice = (getattr(agent, "voice_id", None) or "").strip()
+    env_voice = env_map.get(agent_name, "")
+    return _normalize_voice_id(db_voice or env_voice or default_voice, default=default_voice)
 
 def ensure_core_agents(db: Session, org: str) -> None:
     """Ensure the 3 core agents exist for the org (Summit boardroom edition)."""
@@ -1056,7 +1054,7 @@ Typical response length: 2–4 short paragraphs or a structured technical analys
         aliases=["Chris (VP/CFO)"],
         description="CFO specialist. Financial viability, fundraising, valuation, and capital efficiency.",
         system_prompt=chris_prompt,
-        voice_id="marin",
+        voice_id="marine",
         is_default=False,
     )
     upsert(
@@ -4358,7 +4356,7 @@ def chat(
         "citations": all_citations,
         "agent_id": last_agent.id if last_agent else None,
         "agent_name": last_agent.name if last_agent else None,
-        "voice_id": getattr(last_agent, 'voice_id', None) if last_agent else None,
+        "voice_id": resolve_agent_voice(last_agent) if last_agent else None,
         "avatar_url": getattr(last_agent, 'avatar_url', None) if last_agent else None,
         "runtime_hints": runtime_enrichment.get("runtime_hints") if runtime_enrichment else None,
     }
@@ -6020,7 +6018,7 @@ def list_agents(x_org_slug: Optional[str] = Header(default=None), user=Depends(g
     org = get_request_org(user, x_org_slug)
     ensure_core_agents(db, org)
     rows = db.execute(select(Agent).where(Agent.org_slug == org).order_by(Agent.updated_at.desc())).scalars().all()
-    return [{"id": a.id, "name": a.name, "description": a.description, "rag_enabled": a.rag_enabled, "rag_top_k": a.rag_top_k, "model": a.model, "temperature": a.temperature, "is_default": a.is_default, "voice_id": getattr(a, 'voice_id', None), "avatar_url": getattr(a, 'avatar_url', None), "updated_at": a.updated_at} for a in rows]
+    return [{"id": a.id, "name": a.name, "description": a.description, "rag_enabled": a.rag_enabled, "rag_top_k": a.rag_top_k, "model": a.model, "temperature": a.temperature, "is_default": a.is_default, "voice_id": resolve_agent_voice(a), "avatar_url": getattr(a, 'avatar_url', None), "updated_at": a.updated_at} for a in rows]
 
 
 
@@ -6071,7 +6069,7 @@ def admin_agents(_admin=Depends(require_admin_access), x_org_slug: Optional[str]
     # Admin can list per-org (from header) or all if header omitted in single-tenant mode
     org = get_org(x_org_slug)
     rows = db.execute(select(Agent).where(Agent.org_slug == org).order_by(Agent.updated_at.desc()).limit(200)).scalars().all()
-    return [{"id": a.id, "org_slug": a.org_slug, "name": a.name, "description": a.description, "system_prompt": a.system_prompt, "rag_enabled": a.rag_enabled, "rag_top_k": a.rag_top_k, "model": a.model, "embedding_model": a.embedding_model, "temperature": a.temperature, "is_default": a.is_default, "voice_id": getattr(a, 'voice_id', None), "avatar_url": getattr(a, 'avatar_url', None), "created_at": a.created_at, "updated_at": a.updated_at} for a in rows]
+    return [{"id": a.id, "org_slug": a.org_slug, "name": a.name, "description": a.description, "system_prompt": a.system_prompt, "rag_enabled": a.rag_enabled, "rag_top_k": a.rag_top_k, "model": a.model, "embedding_model": a.embedding_model, "temperature": a.temperature, "is_default": a.is_default, "voice_id": resolve_agent_voice(a), "avatar_url": getattr(a, 'avatar_url', None), "created_at": a.created_at, "updated_at": a.updated_at} for a in rows]
 
 @app.post("/api/admin/agents")
 def admin_create_agent(inp: AgentIn, _admin=Depends(require_admin_access), x_org_slug: Optional[str] = Header(default=None), db: Session = Depends(get_db)):
@@ -6321,7 +6319,7 @@ async def chat_stream(
             "temperature": getattr(ag, "temperature", None),
             "rag_enabled": getattr(ag, "rag_enabled", None),
             "rag_top_k": getattr(ag, "rag_top_k", None),
-            "voice_id": getattr(ag, "voice_id", None),
+            "voice_id": resolve_agent_voice(ag),
             "avatar_url": getattr(ag, "avatar_url", None),
             "active": getattr(ag, "active", None),
         }
@@ -6835,7 +6833,7 @@ async def orchestrate(
             "temperature": getattr(ag, "temperature", None),
             "rag_enabled": getattr(ag, "rag_enabled", None),
             "rag_top_k": getattr(ag, "rag_top_k", None),
-            "voice_id": getattr(ag, "voice_id", None),
+            "voice_id": resolve_agent_voice(ag),
             "avatar_url": getattr(ag, "avatar_url", None),
         }
         for ag in all_agents_rows
@@ -7133,12 +7131,14 @@ async def tts_endpoint(
     if not api_key:
         raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
 
-    # Resolve voice: message_id → agent_id → inp.voice → configured default
-    default_tts_voice = (os.getenv("OPENAI_TTS_VOICE_DEFAULT", "") or os.getenv("OPENAI_REALTIME_VOICE_DEFAULT", "cedar")).strip() or "cedar"
-    voice = inp.voice or default_tts_voice
+    # Resolve voice: admin/db → env-by-agent → explicit inp.voice → configured default
+    default_tts_voice = _normalize_voice_id(
+        (os.getenv("OPENAI_TTS_VOICE_DEFAULT", "") or os.getenv("OPENAI_REALTIME_VOICE_DEFAULT", "cedar")),
+        default="cedar",
+    )
+    voice = _normalize_voice_id(inp.voice or default_tts_voice, default=default_tts_voice)
     org = get_request_org(user, x_org_slug)
     _VALID_VOICES = ("alloy","ash","ballad","cedar","coral","echo","fable","marin","nova","onyx","sage","shimmer","verse")
-    _VOICE_MAP = {"nova": "cedar", "onyx": "echo", "fable": "sage"}
     resolved_via = "default"
     fallback_used = False
     try:
@@ -7150,22 +7150,22 @@ async def tts_endpoint(
                 agent = db.execute(select(Agent).where(
                     Agent.org_slug == org, Agent.id == msg.agent_id
                 )).scalar_one_or_none()
-                if agent and getattr(agent, "voice_id", None):
-                    voice = agent.voice_id
+                if agent:
+                    voice = resolve_agent_voice(agent)
                     resolved_via = f"message_id→agent:{agent.name}"
         elif inp.agent_id:
             agent = db.execute(select(Agent).where(
                 Agent.org_slug == org, Agent.id == inp.agent_id
             )).scalar_one_or_none()
-            if agent and getattr(agent, "voice_id", None):
-                voice = agent.voice_id
+            if agent:
+                voice = resolve_agent_voice(agent)
                 resolved_via = f"agent_id:{agent.name}"
-        elif inp.voice and inp.voice in _VALID_VOICES:
+        elif inp.voice:
+            voice = _normalize_voice_id(inp.voice, default=default_tts_voice)
             resolved_via = "inp.voice"
     except Exception:
         logger.exception("TTS_VOICE_RESOLVE_FAILED trace_id=%s", trace_id)
 
-    voice = _VOICE_MAP.get((voice or "").strip().lower(), (voice or "").strip().lower())
     if voice not in _VALID_VOICES:
         voice = default_tts_voice if default_tts_voice in _VALID_VOICES else "cedar"
     safe_resolved_via = _ascii_safe_text(resolved_via) or "default"
@@ -7468,7 +7468,7 @@ async def realtime_client_secret(
         agent = db.execute(select(Agent).where(Agent.id == body.agent_id, Agent.org_slug == org)).scalar_one_or_none()
         if agent:
             agent_system_prompt = (agent.system_prompt or "").strip()[:8000] or None
-            agent_voice = ((getattr(agent, "voice_id", None) or "") or "").strip() or None
+            agent_voice = resolve_agent_voice(agent) if agent else None
 
     instructions = build_summit_instructions(
         mode=mode,
@@ -7614,7 +7614,7 @@ async def realtime_start(
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found for this tenant")
         agent_name = agent.name
-        agent_voice = ((getattr(agent, "voice_id", None) or "") or "").strip() or None
+        agent_voice = resolve_agent_voice(agent) if agent else None
 
     default_realtime_voice = (os.getenv("OPENAI_REALTIME_VOICE_DEFAULT", "") or os.getenv("OPENAI_TTS_VOICE_DEFAULT", "cedar")).strip() or "cedar"
     voice = normalize_realtime_voice(body.voice or agent_voice or default_realtime_voice, default=default_realtime_voice)
@@ -8486,11 +8486,17 @@ def realtime_get_session(
             )
             .order_by(Message.created_at.asc())
         ).scalars().all()
+        agent_ids = list({getattr(m, "agent_id", None) for m in msgs if getattr(m, "agent_id", None)})
+        agent_rows = db.execute(
+            select(Agent).where(Agent.org_slug == org, Agent.id.in_(agent_ids))
+        ).scalars().all() if agent_ids else []
+        agent_by_id = {a.id: a for a in agent_rows}
         live_assistant_messages = [
             {
                 "id": m.id,
                 "agent_id": getattr(m, "agent_id", None),
                 "agent_name": getattr(m, "agent_name", None),
+                "voice_id": resolve_agent_voice(agent_by_id.get(getattr(m, "agent_id", None))),
                 "content": getattr(m, "content", None),
                 "created_at": getattr(m, "created_at", None),
             }
