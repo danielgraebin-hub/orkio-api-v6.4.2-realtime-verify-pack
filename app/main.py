@@ -784,115 +784,6 @@ def _log_upload_stage(stage: str, **meta: Any) -> None:
     except Exception:
         logger.info("%s %s", stage, meta)
 
-
-
-def _files_has_thread_id(db: Session) -> bool:
-    try:
-        row = db.execute(text("""
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_name = 'files'
-              AND column_name = 'thread_id'
-              AND table_schema = ANY(current_schemas(false))
-            LIMIT 1
-        """)).first()
-        return bool(row)
-    except Exception:
-        return False
-
-def _get_file_basic(db: Session, org: str, file_id: str) -> Optional[Dict[str, Any]]:
-    has_thread = _files_has_thread_id(db)
-    sql = """
-        SELECT id, org_slug, filename, created_at,
-               {thread_expr} AS thread_id,
-               origin, is_institutional, extraction_failed,
-               uploader_id, uploader_name, uploader_email,
-               size_bytes, mime_type
-        FROM files
-        WHERE org_slug = :org AND id = :file_id
-        LIMIT 1
-    """.format(thread_expr=("thread_id" if has_thread else "scope_thread_id"))
-    row = db.execute(text(sql), {"org": org, "file_id": file_id}).mappings().first()
-    return dict(row) if row else None
-
-def _list_files_compat(db: Session, org: str, *, institutional_only: bool = False, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-    has_thread = _files_has_thread_id(db)
-    sql = """
-        SELECT id, org_slug, filename, size_bytes, extraction_failed, is_institutional, origin,
-               {thread_expr} AS thread_id,
-               uploader_id, uploader_name, uploader_email, created_at
-        FROM files
-        WHERE org_slug = :org
-    """.format(thread_expr=("thread_id" if has_thread else "scope_thread_id"))
-    params: Dict[str, Any] = {"org": org}
-    if institutional_only:
-        sql += " AND COALESCE(is_institutional, false) = true"
-    sql += " ORDER BY created_at DESC"
-    if limit is not None:
-        sql += " LIMIT :limit"
-        params["limit"] = int(limit)
-    rows = db.execute(text(sql), params).mappings().all()
-    return [dict(r) for r in rows]
-
-def _insert_file_compat(
-    db: Session,
-    *,
-    id: str,
-    org_slug: str,
-    thread_id: Optional[str],
-    uploader_id: Optional[str],
-    uploader_name: Optional[str],
-    uploader_email: Optional[str],
-    filename: str,
-    original_filename: Optional[str],
-    origin: Optional[str],
-    scope_thread_id: Optional[str],
-    scope_agent_id: Optional[str],
-    mime_type: Optional[str],
-    size_bytes: int,
-    content: bytes,
-    extraction_failed: bool,
-    is_institutional: bool,
-    created_at: int,
-) -> None:
-    cols = [
-        "id", "org_slug", "uploader_id", "uploader_name", "uploader_email",
-        "filename", "original_filename", "origin", "scope_thread_id", "scope_agent_id",
-        "mime_type", "size_bytes", "content", "extraction_failed", "is_institutional", "created_at",
-    ]
-    params: Dict[str, Any] = {
-        "id": id,
-        "org_slug": org_slug,
-        "uploader_id": uploader_id,
-        "uploader_name": uploader_name,
-        "uploader_email": uploader_email,
-        "filename": filename,
-        "original_filename": original_filename,
-        "origin": origin,
-        "scope_thread_id": scope_thread_id,
-        "scope_agent_id": scope_agent_id,
-        "mime_type": mime_type,
-        "size_bytes": int(size_bytes or 0),
-        "content": content,
-        "extraction_failed": bool(extraction_failed),
-        "is_institutional": bool(is_institutional),
-        "created_at": int(created_at),
-    }
-    if _files_has_thread_id(db):
-        cols.insert(2, "thread_id")
-        params["thread_id"] = thread_id
-    sql = f"INSERT INTO files ({', '.join(cols)}) VALUES ({', '.join(':' + c for c in cols)})"
-    db.execute(text(sql), params)
-    db.commit()
-
-def _mark_file_extraction_failed_compat(db: Session, file_id: str) -> None:
-    db.execute(text("UPDATE files SET extraction_failed = true WHERE id = :file_id"), {"file_id": file_id})
-    db.commit()
-
-def _promote_file_institutional_compat(db: Session, file_id: str) -> None:
-    db.execute(text("UPDATE files SET is_institutional = true, origin = 'institutional' WHERE id = :file_id"), {"file_id": file_id})
-    db.commit()
-
 def get_org(x_org_slug: Optional[str]) -> str:
     if tenant_mode() == "single":
         return default_tenant()
@@ -1401,6 +1292,9 @@ def ensure_schema(db: Session):
         db.execute(text("ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS user_name VARCHAR"))
         db.execute(text("ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS agent_id VARCHAR"))
         db.execute(text("ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS agent_name VARCHAR"))
+        # Files schema reconcile hotfix (production drift)
+        db.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS thread_id VARCHAR"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS ix_files_thread_id ON files(thread_id)"))
         # Files uploader provenance (PATCH0100_7)
         db.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_id VARCHAR"))
         db.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_name VARCHAR"))
@@ -1411,6 +1305,10 @@ def ensure_schema(db: Session):
         db.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS scope_agent_id VARCHAR"))
         db.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS is_institutional BOOLEAN NOT NULL DEFAULT FALSE"))
         db.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS origin_thread_id VARCHAR"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS ix_files_org_slug ON files(org_slug)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS ix_files_scope_thread_id ON files(scope_thread_id)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS ix_files_scope_agent_id ON files(scope_agent_id)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS ix_files_origin ON files(origin)"))
         # FileChunks schema reconciliation (PATCH v6.3 drift fix)
         db.execute(text("ALTER TABLE IF EXISTS file_chunks ADD COLUMN IF NOT EXISTS idx INTEGER"))
         db.execute(text("ALTER TABLE IF EXISTS file_chunks ADD COLUMN IF NOT EXISTS agent_id VARCHAR"))
@@ -2741,8 +2639,8 @@ def rag_fallback_recent_chunks(db: Session, org: str, file_ids: List[str], top_k
     ).scalars().all()
     if not chunks:
         return []
-    f = _get_file_basic(db, org, fid)
-    filename = (f or {}).get("filename") if f else fid
+    f = db.get(File, fid)
+    filename = f.filename if f else fid
     out: List[Dict[str, Any]] = []
     for c in chunks:
         out.append({"file_id": fid, "filename": filename, "content": c.content, "score": 0.0, "idx": getattr(c, "idx", None), "fallback": True})
@@ -3616,7 +3514,7 @@ def delete_thread(thread_id: str, x_org_slug: Optional[str] = Header(default=Non
     if not t:
         raise HTTPException(status_code=404, detail="Thread not found")
     db.execute(delete(Message).where(Message.org_slug == org, Message.thread_id == thread_id))
-    db.execute(delete(File).where(File.org_slug == org, File.scope_thread_id == thread_id))
+    db.execute(delete(File).where(File.org_slug == org, File.thread_id == thread_id))
     db.execute(delete(ThreadMember).where(ThreadMember.org_slug == org, ThreadMember.thread_id == thread_id))
     db.execute(delete(Thread).where(Thread.org_slug == org, Thread.id == thread_id))
     db.commit()
@@ -5128,11 +5026,8 @@ async def upload(
         if effective_thread_id and user.get("role") != "admin":
             _require_thread_member(db, org, effective_thread_id, uid)
 
-        file_id = new_id()
-        created_at_ts = now_ts()
-        _insert_file_compat(
-            db,
-            id=file_id,
+        f = File(
+            id=new_id(),
             org_slug=org,
             thread_id=effective_thread_id if effective_intent == "chat" else None,
             uploader_id=user.get("sub"),
@@ -5148,9 +5043,11 @@ async def upload(
             content=raw,
             extraction_failed=False,
             is_institutional=is_institutional,
-            created_at=created_at_ts,
+            created_at=now_ts(),
         )
-        _log_upload_stage("UPLOAD_SAVED", file_id=file_id, filename=filename, size_bytes=len(raw), origin=effective_intent, thread_id=effective_thread_id)
+        db.add(f)
+        db.commit()
+        _log_upload_stage("UPLOAD_SAVED", file_id=f.id, filename=f.filename, size_bytes=f.size_bytes, origin=effective_intent, thread_id=effective_thread_id)
 
         if effective_thread_id:
             try:
@@ -5173,10 +5070,10 @@ async def upload(
                     "institutional_request": bool(institutional_request),
                     "link_all_agents": bool(link_all_agents),
                     "link_agent": bool(link_agent),
-                    "file_id": file_id,
-                    "filename": filename,
-                    "size": int(len(raw) or 0),
-                    "mime": file.content_type,
+                    "file_id": f.id,
+                    "filename": f.filename,
+                    "size": int(f.size_bytes or 0),
+                    "mime": f.mime_type,
                     "uploader_id": user.get("sub"),
                     "uploader_name": user.get("name"),
                     "uploader_email": user.get("email"),
@@ -5195,7 +5092,7 @@ async def upload(
                 )
                 db.add(ev)
                 db.commit()
-                _log_upload_stage("UPLOAD_THREAD_EVENT_OK", thread_id=effective_thread_id, file_id=file_id)
+                _log_upload_stage("UPLOAD_THREAD_EVENT_OK", thread_id=effective_thread_id, file_id=f.id)
             except Exception:
                 logger.exception("UPLOAD_CHAT_EVENT_FAILED")
 
@@ -5212,7 +5109,7 @@ async def upload(
                         )
                     ).scalar_one_or_none()
                     if not existing:
-                        db.add(AgentKnowledge(id=new_id(), org_slug=org, agent_id=ag.id, file_id=file_id, created_at=now_ts()))
+                        db.add(AgentKnowledge(id=new_id(), org_slug=org, agent_id=ag.id, file_id=f.id, created_at=now_ts()))
                 db.commit()
                 _log_upload_stage("UPLOAD_LINKED_ALL_AGENTS", file_id=f.id, count=len(all_agents))
 
@@ -5230,7 +5127,7 @@ async def upload(
                         )
                     ).scalar_one_or_none()
                     if not existing:
-                        db.add(AgentKnowledge(id=new_id(), org_slug=org, agent_id=ag.id, file_id=file_id, created_at=now_ts()))
+                        db.add(AgentKnowledge(id=new_id(), org_slug=org, agent_id=ag.id, file_id=f.id, created_at=now_ts()))
                         linked += 1
                 db.commit()
                 _log_upload_stage("UPLOAD_LINKED_MULTI_AGENT", file_id=f.id, count=linked, agent_ids=resolved_agent_ids)
@@ -5246,7 +5143,7 @@ async def upload(
                         )
                     ).scalar_one_or_none()
                     if not existing:
-                        db.add(AgentKnowledge(id=new_id(), org_slug=org, agent_id=ag.id, file_id=file_id, created_at=now_ts()))
+                        db.add(AgentKnowledge(id=new_id(), org_slug=org, agent_id=ag.id, file_id=f.id, created_at=now_ts()))
                     db.commit()
                     _log_upload_stage("UPLOAD_LINKED_SINGLE_AGENT", file_id=f.id, agent_id=resolved_agent_id)
         except Exception:
@@ -5274,24 +5171,28 @@ async def upload(
         text_content = ""
         chunks_created = 0
         try:
-            _log_upload_stage("EXTRACT_TEXT_STARTED", file_id=file_id, filename=filename, mime_type=file.content_type)
+            _log_upload_stage("EXTRACT_TEXT_STARTED", file_id=f.id, filename=f.filename, mime_type=f.mime_type)
             text_content, extracted_chars = _extract_text_with_fallback(filename, raw, file.content_type)
             if text_content:
-                ft = FileText(id=new_id(), org_slug=org, file_id=file_id, text=text_content, extracted_chars=extracted_chars, created_at=now_ts())
+                ft = FileText(id=new_id(), org_slug=org, file_id=f.id, text=text_content, extracted_chars=extracted_chars, created_at=now_ts())
                 db.add(ft)
-                chunks_created = _create_file_chunks(db, org=org, file_id=file_id, text_content=text_content)
+                chunks_created = _create_file_chunks(db, org=org, file_id=f.id, text_content=text_content)
                 db.commit()
-                _log_upload_stage("CHUNKING_DONE", file_id=file_id, extracted_chars=extracted_chars, chunks_created=chunks_created)
+                _log_upload_stage("CHUNKING_DONE", file_id=f.id, extracted_chars=extracted_chars, chunks_created=chunks_created)
             else:
-                _mark_file_extraction_failed_compat(db, file_id)
-                _log_upload_stage("EXTRACT_TEXT_EMPTY", file_id=file_id, filename=filename)
+                f.extraction_failed = True
+                db.add(f)
+                db.commit()
+                _log_upload_stage("EXTRACT_TEXT_EMPTY", file_id=f.id, filename=f.filename)
         except Exception:
-            logger.exception("UPLOAD_EXTRACT_OR_CHUNK_FAILED file_id=%s", file_id)
+            logger.exception("UPLOAD_EXTRACT_OR_CHUNK_FAILED file_id=%s", f.id)
             try:
                 db.rollback()
             except Exception:
                 pass
-            _mark_file_extraction_failed_compat(db, file_id)
+            f.extraction_failed = True
+            db.add(f)
+            db.commit()
 
         try:
             if effective_intent == "chat" and effective_thread_id:
@@ -5324,26 +5225,26 @@ async def upload(
                 status_code=200,
                 latency_ms=0,
                 meta={
-                    "filename": filename,
+                    "filename": f.filename,
                     "size_bytes": f.size_bytes,
                     "intent": effective_intent,
                     "thread_id": effective_thread_id,
-                    "file_id": file_id,
+                    "file_id": f.id,
                     "chunks_created": chunks_created,
-                    "extraction_failed": False,
+                    "extraction_failed": bool(getattr(f, "extraction_failed", False)),
                 },
             )
         except Exception:
             pass
 
         return {
-            "file_id": file_id,
-            "filename": filename,
+            "file_id": f.id,
+            "filename": f.filename,
             "status": "stored",
             "thread_id": effective_thread_id,
             "extracted_chars": extracted_chars,
             "chunks_created": chunks_created,
-            "extraction_failed": False,
+            "extraction_failed": bool(getattr(f, "extraction_failed", False)),
             "linked_agent_ids": resolved_agent_ids,
             "linked_agent_id": resolved_agent_id,
         }
@@ -5359,7 +5260,7 @@ def list_files(x_org_slug: Optional[str] = Header(default=None), user=Depends(ge
     rows = db.execute(select(File).where(File.org_slug == org).order_by(File.created_at.desc())).scalars().all()
     return [{
         "id": f.id,
-        "filename": filename,
+        "filename": f.filename,
         "size_bytes": f.size_bytes,
         "extraction_failed": f.extraction_failed,
         "created_at": f.created_at,
@@ -5712,7 +5613,7 @@ def admin_approve_file_request(req_id: str, _admin=Depends(require_admin_access)
             )
         ).scalar_one_or_none()
         if not existing:
-            db.add(AgentKnowledge(id=new_id(), org_slug=org, agent_id=ag.id, file_id=file_id, created_at=now_ts()))
+            db.add(AgentKnowledge(id=new_id(), org_slug=org, agent_id=ag.id, file_id=f.id, created_at=now_ts()))
 
     r.status = "approved"
     r.resolved_at = now_ts()
@@ -5747,7 +5648,7 @@ def admin_files(institutional_only: bool = False, _admin=Depends(require_admin_a
     return [{
         "id": f.id,
         "org_slug": f.org_slug,
-        "filename": filename,
+        "filename": f.filename,
         "size_bytes": f.size_bytes,
         "extraction_failed": f.extraction_failed,
         "is_institutional": getattr(f, "is_institutional", False),
@@ -5849,11 +5750,8 @@ async def admin_upload_file(file: UploadFile = UpFile(...), x_org_slug: Optional
 
     _log_upload_stage("UPLOAD_RECEIVED", org=org, user_id=admin.get("sub"), filename=filename, intent="institutional-admin")
 
-    file_id = new_id()
-    created_at_ts = now_ts()
-    _insert_file_compat(
-        db,
-        id=file_id,
+    f = File(
+        id=new_id(),
         org_slug=org,
         thread_id=None,
         uploader_id=admin.get("sub"),
@@ -5862,34 +5760,36 @@ async def admin_upload_file(file: UploadFile = UpFile(...), x_org_slug: Optional
         filename=filename,
         original_filename=filename,
         origin="institutional",
-        scope_thread_id=None,
-        scope_agent_id=None,
         mime_type=file.content_type,
         size_bytes=len(raw),
         content=raw,
         extraction_failed=False,
         is_institutional=True,
-        created_at=created_at_ts,
+        created_at=now_ts(),
     )
-    _log_upload_stage("UPLOAD_SAVED", file_id=file_id, filename=filename, size_bytes=len(raw), origin="institutional")
+    db.add(f)
+    db.commit()
+    _log_upload_stage("UPLOAD_SAVED", file_id=f.id, filename=f.filename, size_bytes=f.size_bytes, origin="institutional")
 
     extracted_chars = 0
     text_content = ""
     chunks_created = 0
     try:
-        _log_upload_stage("EXTRACT_TEXT_STARTED", file_id=file_id, filename=filename, mime_type=file.content_type)
+        _log_upload_stage("EXTRACT_TEXT_STARTED", file_id=f.id, filename=f.filename, mime_type=f.mime_type)
         text_content, extracted_chars = _extract_text_with_fallback(filename, raw, file.content_type)
         if text_content:
-            ft = FileText(id=new_id(), org_slug=org, file_id=file_id, text=text_content, extracted_chars=extracted_chars, created_at=now_ts())
+            ft = FileText(id=new_id(), org_slug=org, file_id=f.id, text=text_content, extracted_chars=extracted_chars, created_at=now_ts())
             db.add(ft)
-            chunks_created = _create_file_chunks(db, org=org, file_id=file_id, text_content=text_content)
+            chunks_created = _create_file_chunks(db, org=org, file_id=f.id, text_content=text_content)
             db.commit()
-            _log_upload_stage("CHUNKING_DONE", file_id=file_id, extracted_chars=extracted_chars, chunks_created=chunks_created)
+            _log_upload_stage("CHUNKING_DONE", file_id=f.id, extracted_chars=extracted_chars, chunks_created=chunks_created)
         else:
-            _mark_file_extraction_failed_compat(db, file_id)
+            f.extraction_failed = True
+            db.add(f)
+            db.commit()
             _log_upload_stage("EXTRACT_TEXT_EMPTY", file_id=f.id, filename=f.filename)
     except Exception:
-        logger.exception("ADMIN_UPLOAD_EXTRACT_OR_CHUNK_FAILED file_id=%s", file_id)
+        logger.exception("ADMIN_UPLOAD_EXTRACT_OR_CHUNK_FAILED file_id=%s", f.id)
         try:
             db.rollback()
         except Exception:
@@ -5916,7 +5816,7 @@ async def admin_upload_file(file: UploadFile = UpFile(...), x_org_slug: Optional
         visible_text = f"📎 Documento institucional anexado: {filename}"
         inst_payload = {
             "kind": "upload", "type": "file_upload", "scope": "institutional",
-            "file_id": file_id, "filename": filename, "size_bytes": int(len(raw) or 0),
+            "file_id": f.id, "filename": f.filename, "size_bytes": int(f.size_bytes or 0),
             "uploader_name": who, "uploader_email": adm_email,
             "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(ts))),
             "ts": ts, "text": visible_text,
@@ -5930,7 +5830,7 @@ async def admin_upload_file(file: UploadFile = UpFile(...), x_org_slug: Optional
         )
         db.add(ev)
         db.commit()
-        _log_upload_stage("FILE_REGISTERED", file_id=file_id, extraction_failed=False, thread_id=inst_thread.id)
+        _log_upload_stage("FILE_REGISTERED", file_id=f.id, extraction_failed=bool(getattr(f, "extraction_failed", False)), thread_id=inst_thread.id)
     except Exception:
         logger.exception("INSTITUTIONAL_THREAD_EVENT_FAILED")
 
@@ -5945,24 +5845,24 @@ async def admin_upload_file(file: UploadFile = UpFile(...), x_org_slug: Optional
             status_code=200,
             latency_ms=0,
             meta={
-                "file_id": file_id,
-                "filename": filename,
+                "file_id": f.id,
+                "filename": f.filename,
                 "is_institutional": True,
                 "chunks_created": chunks_created,
-                "extraction_failed": False,
+                "extraction_failed": bool(getattr(f, "extraction_failed", False)),
             },
         )
     except Exception:
         pass
 
     return {
-        "file_id": file_id,
-        "filename": filename,
+        "file_id": f.id,
+        "filename": f.filename,
         "status": "stored",
         "is_institutional": True,
         "extracted_chars": extracted_chars,
         "chunks_created": chunks_created,
-        "extraction_failed": False,
+        "extraction_failed": bool(getattr(f, "extraction_failed", False)),
     }
 
 @app.get("/api/admin/costs/health")
