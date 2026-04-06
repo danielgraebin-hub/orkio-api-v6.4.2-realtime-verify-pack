@@ -865,6 +865,50 @@ def _seed_default_summit_codes(db: Session, org: str = "public") -> None:
 
 
 
+
+def _ensure_files_schema_hotfix(db: Session) -> None:
+    """
+    Emergency additive reconcile for production drift on table files.
+    Safe to run repeatedly. Must never crash startup.
+    """
+    stmts = [
+        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS thread_id VARCHAR",
+        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_id VARCHAR",
+        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_name VARCHAR",
+        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_email VARCHAR",
+        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS origin VARCHAR",
+        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS original_filename VARCHAR",
+        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS scope_thread_id VARCHAR",
+        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS scope_agent_id VARCHAR",
+        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS is_institutional BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS origin_thread_id VARCHAR",
+        "CREATE INDEX IF NOT EXISTS ix_files_org_slug ON files(org_slug)",
+        "CREATE INDEX IF NOT EXISTS ix_files_thread_id ON files(thread_id)",
+        "CREATE INDEX IF NOT EXISTS ix_files_scope_thread_id ON files(scope_thread_id)",
+        "CREATE INDEX IF NOT EXISTS ix_files_scope_agent_id ON files(scope_agent_id)",
+        "CREATE INDEX IF NOT EXISTS ix_files_origin ON files(origin)",
+    ]
+    try:
+        for stmt in stmts:
+            try:
+                db.execute(text(stmt))
+            except Exception:
+                logger.exception("FILES_SCHEMA_HOTFIX_STMT_FAILED stmt=%s", stmt)
+        db.commit()
+        try:
+            logger.warning("FILES_SCHEMA_HOTFIX_APPLIED")
+        except Exception:
+            pass
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        try:
+            logger.exception("FILES_SCHEMA_HOTFIX_FAILED")
+        except Exception:
+            pass
+
 def ensure_core_agents(db: Session, org: str) -> None:
     """Ensure the 3 core agents exist for the org (Summit boardroom edition)."""
     rows = list(db.execute(select(Agent).where(Agent.org_slug == org).order_by(Agent.created_at.asc())).scalars().all())
