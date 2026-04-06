@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 
 def _db_url() -> str:
@@ -40,6 +40,24 @@ def make_engine():
 
 ENGINE = make_engine()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=ENGINE) if ENGINE else None
+
+
+def _reconcile_files_schema_boot():
+    if ENGINE is None:
+        return
+    try:
+        with ENGINE.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS thread_id VARCHAR"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_files_thread_id ON files(thread_id)"
+            ))
+        print("FILES_SCHEMA_RECONCILE_DB_BOOT_OK")
+    except Exception as e:
+        print("FILES_SCHEMA_RECONCILE_DB_BOOT_FAILED", str(e))
+
+_reconcile_files_schema_boot()
 
 def get_db():
     if SessionLocal is None:
